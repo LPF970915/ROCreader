@@ -1,0 +1,6 @@
+sysroot_device/
+build/
+cache/
+logs/
+book_covers/
+books/
