@@ -153,6 +153,9 @@ constexpr uint32_t kTxtResumeSaveDelayMs = 2000;
 constexpr uint32_t kShelfScanCacheTtlMs = 3000;
 constexpr size_t kShelfScanCacheMaxEntries = 24;
 constexpr uint32_t kIdleFlushOnlyWaitMs = 250;
+constexpr int kReaderRenderMaxDim = 4096;
+constexpr int kReaderRenderMaxPixels = 6 * 1024 * 1024;
+constexpr uint32_t kReaderRenderRetryDelayMs = 500;
 constexpr int kTxtLineSpacing = 8;
 constexpr int kTxtFontPt = 22;
 constexpr size_t kTxtMaxBytes = 12 * 1024 * 1024;
@@ -659,6 +662,13 @@ struct ShelfRenderCache {
   int shelf_page = -1;
   int nav_selected_index = -1;
   uint64_t content_version = 0;
+};
+
+struct ReaderRenderFailureState {
+  int page = -1;
+  int rotation = 0;
+  float scale = 0.0f;
+  uint32_t last_fail_tick = 0;
 };
 
 struct ShelfScanCacheEntry {
@@ -1824,7 +1834,9 @@ int main(int, char **) {
             << " (real_renderer=" << (pdf.HasRealRenderer() ? "yes" : "no") << ")\n";
   ReaderRenderCache render_cache;
   ReaderRenderCache secondary_render_cache;
+  ReaderRenderFailureState render_failure_state;
   std::unordered_map<int, SDL_Point> pdf_page_size_cache;
+  std::unordered_map<int, float> pdf_render_scale_caps;
   ShelfRenderCache shelf_render_cache;
   uint64_t shelf_content_version = 1;
 
@@ -2836,11 +2848,13 @@ int main(int, char **) {
 
   auto invalidate_render = [&]() {
     destroy_render_cache(render_cache);
+    render_failure_state = ReaderRenderFailureState{};
   };
 
   auto invalidate_all_render_cache = [&]() {
     destroy_render_cache(render_cache);
     destroy_render_cache(secondary_render_cache);
+    render_failure_state = ReaderRenderFailureState{};
   };
 
   auto reader_has_real_renderer = [&]() -> bool {
@@ -2876,17 +2890,8 @@ int main(int, char **) {
   };
 
   auto reader_current_page_size = [&](int &w, int &h) -> bool {
-    if (reader_mode != ReaderMode::Pdf) return false;
-    const int page = pdf.CurrentPage();
-    auto it = pdf_page_size_cache.find(page);
-    if (it != pdf_page_size_cache.end()) {
-      w = it->second.x;
-      h = it->second.y;
-      return w > 0 && h > 0;
-    }
-    if (!pdf.CurrentPageSize(w, h)) return false;
-    pdf_page_size_cache[page] = SDL_Point{w, h};
-    return true;
+    if (reader_mode == ReaderMode::Pdf) return pdf.CurrentPageSize(w, h);
+    return false;
   };
 
   auto reader_render_current_page_rgba =
@@ -2915,8 +2920,13 @@ int main(int, char **) {
 
   auto ensure_render = [&]() {
     if (!reader_is_open()) return false;
-    const float final_scale = std::max(0.1f, std::min(6.0f, get_auto_scale() * reader.zoom));
     const int page = reader_current_page();
+    const float requested_scale = std::max(0.1f, std::min(6.0f, get_auto_scale() * reader.zoom));
+    float final_scale = requested_scale;
+    auto cap_it = pdf_render_scale_caps.find(page);
+    if (cap_it != pdf_render_scale_caps.end() && cap_it->second > 0.0f) {
+      final_scale = std::min(final_scale, cap_it->second);
+    }
     if (render_cache.texture && render_cache.page == page && render_cache.rotation == reader.rotation &&
         std::abs(render_cache.scale - final_scale) < 0.0005f) {
       render_cache.last_use = SDL_GetTicks();
@@ -2936,7 +2946,25 @@ int main(int, char **) {
 
     std::vector<unsigned char> rgba;
     int sw = 0, sh = 0;
-    if (!reader_render_current_page_rgba(final_scale, rgba, sw, sh) || sw <= 0 || sh <= 0) return false;
+    float rendered_scale = final_scale;
+    bool rendered = false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      rgba.clear();
+      sw = 0;
+      sh = 0;
+      if (reader_render_current_page_rgba(rendered_scale, rgba, sw, sh) && sw > 0 && sh > 0) {
+        rendered = true;
+        break;
+      }
+      if (rendered_scale <= 0.11f) break;
+      rendered_scale = std::max(0.1f, rendered_scale * 0.7f);
+    }
+    if (!rendered) return false;
+    if (rendered_scale + 0.0005f < requested_scale) {
+      pdf_render_scale_caps[page] = rendered_scale;
+    } else {
+      pdf_render_scale_caps.erase(page);
+    }
 
     // Software rotate to keep scroll-axis math straightforward.
     int rw = sw, rh = sh;
@@ -2989,7 +3017,7 @@ int main(int, char **) {
     render_cache.texture = tex;
     render_cache.page = page;
     render_cache.rotation = reader.rotation;
-    render_cache.scale = final_scale;
+    render_cache.scale = rendered_scale;
     render_cache.w = rw;
     render_cache.h = rh;
     render_cache.last_use = SDL_GetTicks();
@@ -3905,6 +3933,7 @@ int main(int, char **) {
           } else if (ext == ".pdf") {
             if (pdf.Open(current_book)) {
               pdf_page_size_cache.clear();
+              pdf_render_scale_caps.clear();
               close_text_reader();
               reader_mode = ReaderMode::Pdf;
               pdf.SetPage(reader.page);
@@ -3938,6 +3967,7 @@ int main(int, char **) {
             close_text_reader();
             pdf.Close();
             pdf_page_size_cache.clear();
+            pdf_render_scale_caps.clear();
             invalidate_all_render_cache();
           }
           for (auto &v : hold_speed) v = 0.0f;
@@ -4020,6 +4050,7 @@ int main(int, char **) {
         if (reader_mode == ReaderMode::Pdf) {
           pdf.Close();
           pdf_page_size_cache.clear();
+          pdf_render_scale_caps.clear();
         } else if (reader_mode == ReaderMode::Txt) {
           close_text_reader();
         }
@@ -4750,6 +4781,7 @@ int main(int, char **) {
   destroy_shelf_render_cache();
   pdf.Close();
   pdf_page_size_cache.clear();
+  pdf_render_scale_caps.clear();
   for (SDL_GameController *gc : opened_controllers) {
     if (gc) SDL_GameControllerClose(gc);
   }
