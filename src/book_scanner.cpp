@@ -14,7 +14,7 @@ bool HasSupportedExt(const fs::path &p) {
   std::string ext = p.extension().string();
   std::transform(ext.begin(), ext.end(), ext.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return ext == ".pdf" || ext == ".txt";
+  return ext == ".pdf" || ext == ".txt" || ext == ".epub";
 }
 } // namespace
 

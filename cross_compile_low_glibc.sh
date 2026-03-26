@@ -105,6 +105,20 @@ find_so_in_sysroot() {
   return 1
 }
 
+find_so_in_libdir() {
+  name="$1"
+  if [ -f "$LIBDIR/lib${name}.so" ]; then
+    printf "%s/lib%s.so" "$LIBDIR" "$name"
+    return 0
+  fi
+  so_ver="$(ls "$LIBDIR/lib${name}.so."* 2>/dev/null | head -n 1 || true)"
+  if [ -n "$so_ver" ]; then
+    printf "%s" "$so_ver"
+    return 0
+  fi
+  return 1
+}
+
 {
   echo "===== $(date '+%F %T') ====="
   echo "[low_glibc] SYSROOT=$SYSROOT"
@@ -128,8 +142,20 @@ find_so_in_sysroot() {
   "$PKG_CMD" --exists SDL2_ttf && echo "[low_glibc] pkg OK: SDL2_ttf" || echo "[low_glibc] pkg MISS: SDL2_ttf"
   "$PKG_CMD" --exists SDL2_mixer && echo "[low_glibc] pkg OK: SDL2_mixer" || echo "[low_glibc] pkg MISS: SDL2_mixer"
   "$PKG_CMD" --exists poppler-cpp && echo "[low_glibc] pkg OK: poppler-cpp" || echo "[low_glibc] pkg MISS: poppler-cpp"
+  "$PKG_CMD" --exists libzip && echo "[low_glibc] pkg OK: libzip" || echo "[low_glibc] pkg MISS: libzip"
   "$PKG_CMD" --exists mupdf && echo "[low_glibc] pkg OK: mupdf" || echo "[low_glibc] pkg MISS: mupdf"
   "$PKG_CMD" --exists fitz && echo "[low_glibc] pkg OK: fitz" || echo "[low_glibc] pkg MISS: fitz"
+  if [ -f "$SYSROOT/usr/include/zip.h" ]; then
+    echo "[low_glibc] header OK: zip.h"
+  else
+    echo "[low_glibc] header MISS: zip.h"
+  fi
+  TARGET_LIBZIP_SO="$(find_so_in_libdir zip || true)"
+  if [ -n "$TARGET_LIBZIP_SO" ]; then
+    echo "[low_glibc] target lib OK: $TARGET_LIBZIP_SO"
+  else
+    echo "[low_glibc] target lib MISS: libzip for $(basename "$LIBDIR")"
+  fi
 
   # Fallback: force-enable feature libs from sysroot when pkg-config metadata
   # is incomplete/mismatched but headers + shared libs are present.
@@ -141,6 +167,8 @@ find_so_in_sysroot() {
   FALLBACK_MIX_LIBS=""
   FALLBACK_POPPLER_CFLAGS=""
   FALLBACK_POPPLER_LIBS=""
+  FALLBACK_LIBZIP_CFLAGS=""
+  FALLBACK_LIBZIP_LIBS=""
   FALLBACK_MUPDF_CFLAGS=""
   FALLBACK_MUPDF_LIBS=""
 
@@ -170,6 +198,12 @@ find_so_in_sysroot() {
     FALLBACK_POPPLER_CFLAGS="-I$SYSROOT/usr/include/poppler"
     FALLBACK_POPPLER_LIBS="-L$LIBDIR -lpoppler-cpp -lpoppler"
     echo "[low_glibc] fallback enable: poppler-cpp"
+  fi
+
+  if [ -f "$SYSROOT/usr/include/zip.h" ] && [ -n "${TARGET_LIBZIP_SO:-}" ]; then
+    FALLBACK_LIBZIP_CFLAGS="-I$SYSROOT/usr/include"
+    FALLBACK_LIBZIP_LIBS="-L$LIBDIR -lzip"
+    echo "[low_glibc] fallback enable: libzip"
   fi
 
   if [ -f "$SYSROOT/usr/include/mupdf/fitz.h" ] && \
@@ -252,6 +286,19 @@ find_so_in_sysroot() {
   fi
   echo "[low_glibc] final mupdf cflags: $MUPDF_CFLAGS_FINAL"
   echo "[low_glibc] final mupdf libs: $MUPDF_LIBS_FINAL"
+  LIBZIP_CFLAGS_FINAL="$FALLBACK_LIBZIP_CFLAGS"
+  LIBZIP_LIBS_FINAL="$FALLBACK_LIBZIP_LIBS"
+  if [ -z "$LIBZIP_CFLAGS_FINAL" ]; then
+    LIBZIP_CFLAGS_FINAL="$("$PKG_CMD" --cflags libzip 2>/dev/null || true)"
+  fi
+  if [ -z "$LIBZIP_LIBS_FINAL" ]; then
+    LIBZIP_LIBS_FINAL="$("$PKG_CMD" --libs libzip 2>/dev/null || true)"
+  fi
+  if [ -z "$LIBZIP_CFLAGS_FINAL" ] || [ -z "$LIBZIP_LIBS_FINAL" ]; then
+    echo "[low_glibc] libzip not enabled for target build"
+  fi
+  echo "[low_glibc] LIBZIP_CFLAGS=$LIBZIP_CFLAGS_FINAL"
+  echo "[low_glibc] LIBZIP_LIBS=$LIBZIP_LIBS_FINAL"
 
   echo "[low_glibc] make clean"
   make clean
@@ -270,6 +317,8 @@ find_so_in_sysroot() {
     MIX_LIBS="$FALLBACK_MIX_LIBS" \
     POPPLER_CFLAGS="$FALLBACK_POPPLER_CFLAGS" \
     POPPLER_LIBS="$FALLBACK_POPPLER_LIBS" \
+    LIBZIP_CFLAGS="$LIBZIP_CFLAGS_FINAL" \
+    LIBZIP_LIBS="$LIBZIP_LIBS_FINAL" \
     MUPDF_CFLAGS="$MUPDF_CFLAGS_FINAL" \
     MUPDF_LIBS="$MUPDF_LIBS_FINAL" \
     EXTRA_CXXFLAGS="--sysroot=$SYSROOT" \
@@ -368,6 +417,11 @@ find_so_in_sysroot() {
     "$RUNTIME_DIR/lib/ld-linux-"*.so.* \
     "$RUNTIME_DIR/lib/librt.so."* \
     "$RUNTIME_DIR/lib/libresolv.so."* 2>/dev/null || true
+
+  LIBZIP_SO_ABS="${TARGET_LIBZIP_SO:-}"
+  if [ -n "$LIBZIP_SO_ABS" ] && [ ! -f "$RUNTIME_DIR/lib/$(basename "$LIBZIP_SO_ABS")" ]; then
+    cp -L "$LIBZIP_SO_ABS" "$RUNTIME_DIR/lib/" || true
+  fi
 
   cp -a "$RUNTIME_DIR/lib/." "$RUNTIME_DIR/lib_system_sdl/"
   rm -f \

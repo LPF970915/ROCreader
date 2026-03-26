@@ -29,6 +29,8 @@
 
 #include "book_scanner.h"
 #include "cover_resolver.h"
+#include "epub_comic_reader.h"
+#include "epub_reader.h"
 #include "pdf_reader.h"
 #include "storage_paths.h"
 #include "animation.h"
@@ -584,6 +586,7 @@ enum class ReaderMode {
   None = 0,
   Pdf = 1,
   Txt = 2,
+  Epub = 3,
 };
 
 struct ReaderRenderCache {
@@ -1416,6 +1419,82 @@ private:
   uint32_t last_dirty_tick_ = 0;
 };
 
+class RecentPathStore {
+public:
+  explicit RecentPathStore(std::string path) : path_(std::move(path)) { Load(); }
+
+  bool Contains(const std::string &book_path) const {
+    return set_.find(NormalizePathKey(book_path)) != set_.end();
+  }
+
+  void Add(const std::string &book_path) {
+    const std::string key = NormalizePathKey(book_path);
+    if (key.empty()) return;
+    auto it = std::find(order_.begin(), order_.end(), key);
+    if (it != order_.end()) {
+      if (it == order_.begin()) return;
+      order_.erase(it);
+      order_.insert(order_.begin(), key);
+      MarkDirty();
+      return;
+    }
+    set_.insert(key);
+    order_.insert(order_.begin(), key);
+    MarkDirty();
+  }
+
+  void Remove(const std::string &book_path) {
+    const std::string key = NormalizePathKey(book_path);
+    if (set_.erase(key) == 0) return;
+    order_.erase(std::remove(order_.begin(), order_.end(), key), order_.end());
+    MarkDirty();
+  }
+
+  void Clear() {
+    if (order_.empty()) return;
+    set_.clear();
+    order_.clear();
+    MarkDirty();
+  }
+
+  const std::vector<std::string> &OrderedPaths() const { return order_; }
+
+  bool IsDirty() const { return dirty_; }
+  bool ShouldFlush(uint32_t now, uint32_t delay_ms) const {
+    return dirty_ && (last_dirty_tick_ == 0 || now - last_dirty_tick_ >= delay_ms);
+  }
+  void MarkDirty() {
+    dirty_ = true;
+    last_dirty_tick_ = SDL_GetTicks();
+  }
+  void Save() {
+    std::ofstream out(path_, std::ios::trunc);
+    if (!out) return;
+    for (const auto &v : order_) out << v << "\n";
+    dirty_ = false;
+    last_dirty_tick_ = 0;
+  }
+
+private:
+  void Load() {
+    std::ifstream in(path_);
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      const std::string key = NormalizePathKey(line);
+      if (key.empty() || !set_.insert(key).second) continue;
+      order_.push_back(key);
+    }
+  }
+
+  std::string path_;
+  std::unordered_set<std::string> set_;
+  std::vector<std::string> order_;
+  bool dirty_ = false;
+  uint32_t last_dirty_tick_ = 0;
+};
+
 void DrawRect(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c, bool fill = true) {
   SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
   SDL_Rect rc{x, y, w, h};
@@ -1788,8 +1867,8 @@ int main(int, char **) {
     std::cout << "[native_h700] sound: force enable audio=1 on startup\n";
   }
   ProgressStore progress(progress_path.string());
-  PathSetStore favorites_store(favorites_path.string());
-  PathSetStore history_store(history_path.string());
+  RecentPathStore favorites_store(favorites_path.string());
+  RecentPathStore history_store(history_path.string());
   VolumeController volume_controller(use_h700_defaults);
   bool warned_system_volume_fallback = false;
   std::cout << "[native_h700] volume controller: prefer_system="
@@ -1830,8 +1909,11 @@ int main(int, char **) {
     if ((force || history_store.ShouldFlush(tick_now, kDeferredSaveDelayMs)) && history_store.IsDirty()) history_store.Save();
   };
   PdfReader pdf;
+  EpubComicReader epub_comic;
   std::cout << "[native_h700] pdf backend: " << pdf.BackendName()
             << " (real_renderer=" << (pdf.HasRealRenderer() ? "yes" : "no") << ")\n";
+  std::cout << "[native_h700] epub comic backend: " << epub_comic.BackendName()
+            << " (real_renderer=" << (epub_comic.HasRealRenderer() ? "yes" : "no") << ")\n";
   ReaderRenderCache render_cache;
   ReaderRenderCache secondary_render_cache;
   ReaderRenderFailureState render_failure_state;
@@ -1888,6 +1970,7 @@ int main(int, char **) {
   std::array<bool, kButtonCount> long_fired{};
   int nav_selected_index = 0; // 0: ALL COMICS, 1: ALL BOOKS, 2: COLLECTIONS, 3: HISTORY
   bool warned_mock_pdf_backend = false;
+  bool warned_epub_backend = false;
 
   auto current_category = [&]() -> ShelfCategory {
     return static_cast<ShelfCategory>(ClampInt(nav_selected_index, 0, 3));
@@ -1927,7 +2010,7 @@ int main(int, char **) {
     }
     const std::string ext = GetLowerExt(item.path);
     if (category == ShelfCategory::AllComics) {
-      return ext == ".pdf";
+      return ext == ".pdf" || ext == ".epub";
     }
     if (category == ShelfCategory::AllBooks) {
       return ext == ".txt";
@@ -1983,7 +2066,7 @@ int main(int, char **) {
             const auto &entry = *it;
             if (entry.is_regular_file(ec)) {
               const std::string ext = GetLowerExt(entry.path().string());
-              if (ext != ".pdf") continue;
+              if (ext != ".pdf" && ext != ".epub") continue;
               BookItem item;
               item.name = entry.path().filename().string();
               item.path = entry.path().string();
@@ -1991,7 +2074,8 @@ int main(int, char **) {
               out.push_back(std::move(item));
             } else if (entry.is_directory(ec)) {
               const bool pure_pdf = is_pure_ext_folder(entry.path().string(), ".pdf");
-              if (!pure_pdf) continue;
+              const bool pure_epub = is_pure_ext_folder(entry.path().string(), ".epub");
+              if (!pure_pdf && !pure_epub) continue;
               BookItem item;
               item.name = entry.path().filename().string();
               item.path = entry.path().string();
@@ -2010,7 +2094,7 @@ int main(int, char **) {
             const auto &entry = *it;
             if (!entry.is_regular_file(ec)) continue;
             const std::string ext = GetLowerExt(entry.path().string());
-            if (ext != ".pdf") continue;
+            if (ext != ".pdf" && ext != ".epub") continue;
             BookItem item;
             item.name = entry.path().filename().string();
             item.path = entry.path().string();
@@ -2083,9 +2167,8 @@ int main(int, char **) {
       return out;
     }
 
-    if (current_folder.empty() &&
-        (cat == ShelfCategory::Collections || cat == ShelfCategory::History)) {
-      std::vector<BookItem> out;
+    if (current_folder.empty() && cat == ShelfCategory::Collections) {
+      std::unordered_map<std::string, BookItem> found;
       for (const auto &root : books_roots) {
         std::error_code ec;
         const std::filesystem::path root_path(root);
@@ -2096,15 +2179,51 @@ int main(int, char **) {
           const auto &entry = *it;
           if (!entry.is_regular_file(ec)) continue;
           const std::string ext = GetLowerExt(entry.path().string());
-          if (ext != ".pdf" && ext != ".txt") continue;
+          if (ext != ".pdf" && ext != ".txt" && ext != ".epub") continue;
           BookItem item;
           item.name = entry.path().filename().string();
           item.path = entry.path().string();
           item.is_dir = false;
-          out.push_back(std::move(item));
+          found.emplace(NormalizePathKey(item.path), std::move(item));
         }
       }
-      std::sort(out.begin(), out.end(), [](const BookItem &a, const BookItem &b) { return a.name < b.name; });
+
+      std::vector<BookItem> out;
+      for (const auto &path_key : favorites_store.OrderedPaths()) {
+        auto it = found.find(path_key);
+        if (it != found.end()) out.push_back(it->second);
+      }
+      shelf_scan_cache[cache_key] = ShelfScanCacheEntry{out, cache_now};
+      prune_shelf_scan_cache();
+      return out;
+    }
+
+    if (current_folder.empty() && cat == ShelfCategory::History) {
+      std::unordered_map<std::string, BookItem> found;
+      for (const auto &root : books_roots) {
+        std::error_code ec;
+        const std::filesystem::path root_path(root);
+        if (!std::filesystem::exists(root_path, ec) || !std::filesystem::is_directory(root_path, ec)) continue;
+        const auto opts = std::filesystem::directory_options::skip_permission_denied;
+        for (std::filesystem::recursive_directory_iterator it(root_path, opts, ec), end; it != end; it.increment(ec)) {
+          if (ec) continue;
+          const auto &entry = *it;
+          if (!entry.is_regular_file(ec)) continue;
+          const std::string ext = GetLowerExt(entry.path().string());
+          if (ext != ".pdf" && ext != ".txt" && ext != ".epub") continue;
+          BookItem item;
+          item.name = entry.path().filename().string();
+          item.path = entry.path().string();
+          item.is_dir = false;
+          found.emplace(NormalizePathKey(item.path), std::move(item));
+        }
+      }
+
+      std::vector<BookItem> out;
+      for (const auto &path_key : history_store.OrderedPaths()) {
+        auto it = found.find(path_key);
+        if (it != found.end()) out.push_back(it->second);
+      }
       shelf_scan_cache[cache_key] = ShelfScanCacheEntry{out, cache_now};
       prune_shelf_scan_cache();
       return out;
@@ -2297,6 +2416,75 @@ int main(int, char **) {
     return tex;
   };
 
+  auto make_epub_cover_cache_key = [&](const std::string &doc_path,
+                                       uintmax_t logical_size,
+                                       long long logical_mtime) {
+    return NormalizePathKey(doc_path) + "|" + std::to_string(logical_size) + "|" + std::to_string(logical_mtime) +
+           "|" + std::to_string(Layout().cover_w) + "x" + std::to_string(Layout().cover_h) + "|epub-cover-v1";
+  };
+
+  auto get_epub_cover_cache_file = [&](const std::string &doc_path,
+                                       uintmax_t logical_size,
+                                       long long logical_mtime) -> std::filesystem::path {
+    const std::string cache_key = make_epub_cover_cache_key(doc_path, logical_size, logical_mtime);
+    const size_t hash_value = std::hash<std::string>{}(cache_key);
+    std::ostringstream oss;
+    oss << std::hex << hash_value << ".bmp";
+    return cover_thumb_cache_dir / oss.str();
+  };
+
+  auto load_cached_epub_cover_texture = [&](const std::string &doc_path,
+                                            uintmax_t logical_size,
+                                            long long logical_mtime) -> SDL_Texture * {
+    const std::filesystem::path cache_file = get_epub_cover_cache_file(doc_path, logical_size, logical_mtime);
+    std::error_code ec;
+    if (!std::filesystem::exists(cache_file, ec) || ec) return nullptr;
+    SDL_Surface *cover_surface = LoadSurfaceFromFile(cache_file.string());
+    if (!cover_surface) return nullptr;
+    SDL_Texture *normalized = CreateNormalizedCoverTexture(renderer, cover_surface);
+    if (!normalized) normalized = CreateTextureFromSurface(renderer, cover_surface);
+    SDL_FreeSurface(cover_surface);
+    if (normalized) {
+      remember_texture_size(normalized, Layout().cover_w, Layout().cover_h);
+      return normalized;
+    }
+    return nullptr;
+  };
+
+  auto save_epub_cover_cache_to_disk = [&](const std::string &doc_path,
+                                           uintmax_t logical_size,
+                                           long long logical_mtime,
+                                           SDL_Surface *cover_surface) {
+    if (!cover_surface) return;
+    std::error_code ec;
+    std::filesystem::create_directories(cover_thumb_cache_dir, ec);
+    const std::filesystem::path cache_file = get_epub_cover_cache_file(doc_path, logical_size, logical_mtime);
+    SDL_SaveBMP(cover_surface, cache_file.string().c_str());
+  };
+
+  auto create_epub_first_image_cover_texture = [&](const std::string &doc_path) -> SDL_Texture * {
+    EpubReader epub;
+    EpubReader::CoverImage cover_image;
+    std::string error;
+    if (!epub.ExtractCoverImage(doc_path, cover_image, error)) return nullptr;
+
+    if (SDL_Texture *cached =
+            load_cached_epub_cover_texture(doc_path, cover_image.logical_size, cover_image.logical_mtime)) {
+      return cached;
+    }
+
+    SDL_Surface *cover_surface = LoadSurfaceFromMemory(cover_image.bytes.data(), cover_image.bytes.size());
+    if (!cover_surface) return nullptr;
+    SDL_Texture *normalized = CreateNormalizedCoverTexture(renderer, cover_surface);
+    if (!normalized) normalized = CreateTextureFromSurface(renderer, cover_surface);
+    if (normalized) {
+      remember_texture_size(normalized, Layout().cover_w, Layout().cover_h);
+      save_epub_cover_cache_to_disk(doc_path, cover_image.logical_size, cover_image.logical_mtime, cover_surface);
+    }
+    SDL_FreeSurface(cover_surface);
+    return normalized;
+  };
+
   auto load_cover_from_path = [&](const std::string &cover_path) -> SDL_Texture * {
     if (cover_path.empty()) return nullptr;
     SDL_Surface *cover_surface = LoadSurfaceFromFile(cover_path);
@@ -2338,16 +2526,36 @@ int main(int, char **) {
     if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) return {};
     const auto opts = std::filesystem::directory_options::skip_permission_denied;
     bool has_pdf = false;
+    bool has_epub = false;
     for (std::filesystem::recursive_directory_iterator it(root, opts, ec), end; it != end; it.increment(ec)) {
       if (ec) continue;
       const auto &entry = *it;
       if (!entry.is_regular_file(ec)) continue;
       const std::string ext = GetLowerExt(entry.path().string());
       if (ext == ".pdf") has_pdf = true;
+      else if (ext == ".epub") has_epub = true;
       else continue;
     }
     if (has_pdf) return ".pdf";
+    if (has_epub) return ".epub";
     return {};
+  };
+
+  auto find_first_doc_in_folder = [&](const std::string &folder_path, const std::string &wanted_ext) -> std::string {
+    std::error_code ec;
+    const std::filesystem::path root(folder_path);
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) return {};
+    const auto opts = std::filesystem::directory_options::skip_permission_denied;
+    std::vector<std::string> matches;
+    for (std::filesystem::recursive_directory_iterator it(root, opts, ec), end; it != end; it.increment(ec)) {
+      if (ec) continue;
+      const auto &entry = *it;
+      if (!entry.is_regular_file(ec)) continue;
+      if (GetLowerExt(entry.path().string()) != wanted_ext) continue;
+      matches.push_back(entry.path().string());
+    }
+    std::sort(matches.begin(), matches.end());
+    return matches.empty() ? std::string{} : matches.front();
   };
 
   auto load_comic_cover = [&](const BookItem &item) -> SDL_Texture * {
@@ -2355,15 +2563,33 @@ int main(int, char **) {
       SDL_Texture *tex = load_manual_cover_exact_then_fuzzy(item);
       if (tex) return tex;
       const std::string kind = detect_comic_folder_type(item.path);
+      if (kind == ".pdf") {
+        const std::string pdf_path = find_first_doc_in_folder(item.path, ".pdf");
+        if (!pdf_path.empty()) {
+          tex = create_doc_first_page_cover_texture(pdf_path);
+          if (tex) return tex;
+        }
+      } else if (kind == ".epub") {
+        const std::string epub_path = find_first_doc_in_folder(item.path, ".epub");
+        if (!epub_path.empty()) {
+          tex = create_epub_first_image_cover_texture(epub_path);
+          if (tex) return tex;
+        }
+      }
       if (kind == ".pdf") return ui_assets.book_cover_pdf ? ui_assets.book_cover_pdf : ui_assets.book_cover_txt;
       return ui_assets.book_cover_pdf ? ui_assets.book_cover_pdf : ui_assets.book_cover_txt;
     }
     const std::string ext = GetLowerExt(item.path);
-    if (ext != ".pdf") return nullptr;
+    if (ext != ".pdf" && ext != ".epub") return nullptr;
     SDL_Texture *tex = load_manual_cover_exact_then_fuzzy(item);
     if (tex) return tex;
-    tex = create_doc_first_page_cover_texture(item.path);
-    if (tex) return tex;
+    if (ext == ".pdf") {
+      tex = create_doc_first_page_cover_texture(item.path);
+      if (tex) return tex;
+    } else if (ext == ".epub") {
+      tex = create_epub_first_image_cover_texture(item.path);
+      if (tex) return tex;
+    }
     return ui_assets.book_cover_pdf ? ui_assets.book_cover_pdf : ui_assets.book_cover_txt;
   };
 
@@ -2377,7 +2603,7 @@ int main(int, char **) {
     SDL_Texture *tex = nullptr;
     const std::string ext = item.is_dir ? std::string{} : GetLowerExt(item.path);
     if ((item.is_dir && current_category() == ShelfCategory::AllComics) ||
-        ext == ".pdf") {
+        ext == ".pdf" || ext == ".epub") {
       tex = load_comic_cover(item);
     } else {
       tex = load_txt_cover(item);
@@ -2859,44 +3085,53 @@ int main(int, char **) {
 
   auto reader_has_real_renderer = [&]() -> bool {
     if (reader_mode == ReaderMode::Pdf) return pdf.HasRealRenderer();
+    if (reader_mode == ReaderMode::Epub) return epub_comic.HasRealRenderer();
     return false;
   };
 
   auto reader_is_open = [&]() -> bool {
     if (reader_mode == ReaderMode::Pdf) return pdf.IsOpen();
+    if (reader_mode == ReaderMode::Epub) return epub_comic.IsOpen();
     return false;
   };
 
   auto reader_page_count = [&]() -> int {
     if (reader_mode == ReaderMode::Pdf) return pdf.PageCount();
+    if (reader_mode == ReaderMode::Epub) return epub_comic.PageCount();
     return 0;
   };
 
   auto reader_current_page = [&]() -> int {
     if (reader_mode == ReaderMode::Pdf) return pdf.CurrentPage();
+    if (reader_mode == ReaderMode::Epub) return epub_comic.CurrentPage();
     return 0;
   };
 
   auto reader_set_page = [&](int page_index) {
     if (reader_mode == ReaderMode::Pdf) pdf.SetPage(page_index);
+    if (reader_mode == ReaderMode::Epub) epub_comic.SetPage(page_index);
   };
 
   auto reader_next_page = [&]() {
     if (reader_mode == ReaderMode::Pdf) pdf.NextPage();
+    if (reader_mode == ReaderMode::Epub) epub_comic.NextPage();
   };
 
   auto reader_prev_page = [&]() {
     if (reader_mode == ReaderMode::Pdf) pdf.PrevPage();
+    if (reader_mode == ReaderMode::Epub) epub_comic.PrevPage();
   };
 
   auto reader_current_page_size = [&](int &w, int &h) -> bool {
     if (reader_mode == ReaderMode::Pdf) return pdf.CurrentPageSize(w, h);
+    if (reader_mode == ReaderMode::Epub) return epub_comic.CurrentPageSize(w, h);
     return false;
   };
 
   auto reader_render_current_page_rgba =
       [&](float scale, std::vector<unsigned char> &rgba, int &w, int &h) -> bool {
     if (reader_mode == ReaderMode::Pdf) return pdf.RenderCurrentPageRGBA(scale, rgba, w, h);
+    if (reader_mode == ReaderMode::Epub) return epub_comic.RenderCurrentPageRGBA(scale, rgba, w, h);
     return false;
   };
 
@@ -3948,6 +4183,25 @@ int main(int, char **) {
                 warned_mock_pdf_backend = true;
               }
             }
+          } else if (ext == ".epub") {
+            if (epub_comic.Open(current_book)) {
+              pdf_page_size_cache.clear();
+              pdf_render_scale_caps.clear();
+              close_text_reader();
+              pdf.Close();
+              reader_mode = ReaderMode::Epub;
+              epub_comic.SetPage(reader.page);
+              invalidate_all_render_cache();
+              clamp_scroll();
+              opened = true;
+            }
+            if (!opened && !epub_comic.HasRealRenderer()) {
+              if (!warned_epub_backend) {
+                std::cerr << "[reader] blocked: current build has no epub comic backend. "
+                             "Please rebuild with libzip (pkg-config libzip) available.\n";
+                warned_epub_backend = true;
+              }
+            }
           } else {
             // Keep unsupported formats in shelf for now.
             std::cerr << "[reader] unsupported format for runtime reader: " << current_book << "\n";
@@ -3960,12 +4214,13 @@ int main(int, char **) {
             scene_flash.Snap(kSceneFadeFlashAlpha);
             scene_flash.AnimateTo(0.0f, kSceneFadeFlashDurationSec, animation::Ease::OutCubic);
           } else {
-            if (ext == ".pdf") {
+            if (ext == ".pdf" || ext == ".epub") {
               std::cerr << "[reader] failed to open: " << current_book << "\n";
             }
             current_book.clear();
             close_text_reader();
             pdf.Close();
+            epub_comic.Close();
             pdf_page_size_cache.clear();
             pdf_render_scale_caps.clear();
             invalidate_all_render_cache();
@@ -4040,6 +4295,8 @@ int main(int, char **) {
       if (input.IsJustPressed(Button::B)) {
         if (reader_mode == ReaderMode::Pdf && pdf.IsOpen()) {
           reader.page = pdf.CurrentPage();
+        } else if (reader_mode == ReaderMode::Epub && epub_comic.IsOpen()) {
+          reader.page = epub_comic.CurrentPage();
         } else if (reader_mode == ReaderMode::Txt && txt_reader.open) {
           reader.page = (txt_reader.line_h > 0) ? (txt_reader.scroll_px / txt_reader.line_h) : 0;
           reader.scroll_y = txt_reader.scroll_px;
@@ -4049,6 +4306,10 @@ int main(int, char **) {
         progress.Set(current_book, reader);
         if (reader_mode == ReaderMode::Pdf) {
           pdf.Close();
+          pdf_page_size_cache.clear();
+          pdf_render_scale_caps.clear();
+        } else if (reader_mode == ReaderMode::Epub) {
+          epub_comic.Close();
           pdf_page_size_cache.clear();
           pdf_render_scale_caps.clear();
         } else if (reader_mode == ReaderMode::Txt) {
@@ -4559,7 +4820,7 @@ int main(int, char **) {
             pct = (max_scroll > 0)
                       ? ClampInt(static_cast<int>((static_cast<int64_t>(txt_reader.scroll_px) * 100) / max_scroll), 0, 100)
                       : 100;
-          } else if (reader_mode == ReaderMode::Pdf && pdf.IsOpen()) {
+          } else if (reader_is_open()) {
             const int page_count = std::max(1, reader_page_count());
             const int page_idx = ClampInt(reader_current_page(), 0, page_count - 1);
             pct = (page_count <= 1) ? 100 : ClampInt(static_cast<int>((static_cast<int64_t>(page_idx) * 100) / (page_count - 1)), 0, 100);
@@ -4728,6 +4989,8 @@ int main(int, char **) {
   if (!current_book.empty()) {
     if (reader_mode == ReaderMode::Pdf && pdf.IsOpen()) {
       reader.page = pdf.CurrentPage();
+    } else if (reader_mode == ReaderMode::Epub && epub_comic.IsOpen()) {
+      reader.page = epub_comic.CurrentPage();
     } else if (reader_mode == ReaderMode::Txt && txt_reader.open) {
       reader.page = (txt_reader.line_h > 0) ? (txt_reader.scroll_px / txt_reader.line_h) : 0;
       reader.scroll_y = txt_reader.scroll_px;
@@ -4780,6 +5043,7 @@ int main(int, char **) {
   invalidate_all_render_cache();
   destroy_shelf_render_cache();
   pdf.Close();
+  epub_comic.Close();
   pdf_page_size_cache.clear();
   pdf_render_scale_caps.clear();
   for (SDL_GameController *gc : opened_controllers) {

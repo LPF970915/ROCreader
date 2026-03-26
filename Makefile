@@ -3,7 +3,7 @@ PKG_CONFIG ?= pkg-config
 REQUIRE_MUPDF ?= 0
 
 TARGET := build/rocreader_sdl
-SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/cover_resolver.cpp src/animation.cpp
+SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/animation.cpp
 OBJS := $(SRCS:.cpp=.o)
 
 SDL_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
@@ -54,6 +54,13 @@ CXXFLAGS += -DHAVE_POPPLER $(POPPLER_CFLAGS)
 LDFLAGS += $(POPPLER_LIBS)
 endif
 
+LIBZIP_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags libzip 2>/dev/null)
+LIBZIP_LIBS ?= $(shell $(PKG_CONFIG) --libs libzip 2>/dev/null)
+ifneq ($(strip $(LIBZIP_LIBS)),)
+CXXFLAGS += -DHAVE_LIBZIP $(LIBZIP_CFLAGS)
+LDFLAGS += $(LIBZIP_LIBS)
+endif
+
 ifeq ($(REQUIRE_MUPDF),1)
 ifeq ($(strip $(MUPDF_LIBS)$(POPPLER_LIBS)),)
 $(error REQUIRE_MUPDF=1 but no real PDF backend found. Install MuPDF/Fitz or poppler-cpp dev package.)
@@ -83,6 +90,8 @@ print-config:
 	@echo "MUPDF_LIBS=$(MUPDF_LIBS)"
 	@echo "POPPLER_CFLAGS=$(POPPLER_CFLAGS)"
 	@echo "POPPLER_LIBS=$(POPPLER_LIBS)"
+	@echo "LIBZIP_CFLAGS=$(LIBZIP_CFLAGS)"
+	@echo "LIBZIP_LIBS=$(LIBZIP_LIBS)"
 	@echo "TTF_CFLAGS=$(TTF_CFLAGS)"
 	@echo "TTF_LIBS=$(TTF_LIBS)"
 	@echo "MIX_CFLAGS=$(MIX_CFLAGS)"
