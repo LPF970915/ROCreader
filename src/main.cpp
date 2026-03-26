@@ -20,6 +20,13 @@
 #include <iostream>
 #include <codecvt>
 #include <locale>
+#if !defined(_WIN32) && __has_include(<iconv.h>)
+#include <errno.h>
+#include <iconv.h>
+#define ROCREADER_HAS_ICONV 1
+#else
+#define ROCREADER_HAS_ICONV 0
+#endif
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -155,6 +162,9 @@ constexpr uint32_t kTxtResumeSaveDelayMs = 2000;
 constexpr uint32_t kShelfScanCacheTtlMs = 3000;
 constexpr size_t kShelfScanCacheMaxEntries = 24;
 constexpr uint32_t kIdleFlushOnlyWaitMs = 250;
+constexpr size_t kBootCountBatchEntries = 96;
+constexpr size_t kBootScanBatchEntries = 48;
+constexpr size_t kBootCoverGenerateBatchEntries = 1;
 constexpr int kReaderRenderMaxDim = 4096;
 constexpr int kReaderRenderMaxPixels = 6 * 1024 * 1024;
 constexpr uint32_t kReaderRenderRetryDelayMs = 500;
@@ -182,6 +192,7 @@ int FocusedCoverH() { return static_cast<int>(Layout().cover_h * kFocusScale + 0
 std::string NormalizePathKey(const std::string &path);
 
 enum class State { Boot, Shelf, Settings, Reader };
+enum class BootPhase { CountBooks, ScanBooks, GenerateCovers, Finalize, Done };
 
 enum class Button {
   Up,
@@ -241,7 +252,7 @@ const char *SdlEventName(Uint32 type) {
   }
 }
 
-enum class SettingId { KeyGuide, ContactMe, ClearHistory, ExitApp };
+enum class SettingId { KeyGuide, ClearHistory, CleanCache, TxtToUtf8, ContactMe, ExitApp };
 
 struct BtnState {
   bool down = false;
@@ -650,6 +661,16 @@ struct TxtResumeCacheEntry {
   bool truncation_notice_added = false;
 };
 
+struct TxtTranscodeJob {
+  bool active = false;
+  std::vector<std::string> files;
+  size_t total = 0;
+  size_t processed = 0;
+  size_t converted = 0;
+  size_t failed = 0;
+  std::string current_file;
+};
+
 struct CoverCacheEntry {
   SDL_Texture *texture = nullptr;
   int w = 0;
@@ -697,6 +718,8 @@ struct UiAssets {
   SDL_Texture *settings_preview_keyguide = nullptr;
   SDL_Texture *settings_preview_contact = nullptr;
   SDL_Texture *settings_preview_clean_history = nullptr;
+  SDL_Texture *settings_preview_clean_cache = nullptr;
+  SDL_Texture *settings_preview_txt_to_utf8 = nullptr;
   SDL_Texture *settings_preview_exit = nullptr;
 };
 
@@ -1562,6 +1585,276 @@ size_t Utf8CharLen(unsigned char c) {
   return 1;
 }
 
+bool IsValidUtf8(const std::string &text) {
+  size_t i = 0;
+  while (i < text.size()) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    size_t len = 0;
+    uint32_t codepoint = 0;
+    if ((c & 0x80) == 0x00) {
+      len = 1;
+      codepoint = c;
+    } else if ((c & 0xE0) == 0xC0) {
+      len = 2;
+      codepoint = c & 0x1F;
+      if (codepoint < 0x02) return false;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+      codepoint = c & 0x0F;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+      codepoint = c & 0x07;
+      if (codepoint > 0x04) return false;
+    } else {
+      return false;
+    }
+    if (i + len > text.size()) return false;
+    for (size_t j = 1; j < len; ++j) {
+      const unsigned char cc = static_cast<unsigned char>(text[i + j]);
+      if ((cc & 0xC0) != 0x80) return false;
+      codepoint = (codepoint << 6) | (cc & 0x3F);
+    }
+    if ((len == 2 && codepoint < 0x80) ||
+        (len == 3 && codepoint < 0x800) ||
+        (len == 4 && codepoint < 0x10000) ||
+        codepoint > 0x10FFFF ||
+        (codepoint >= 0xD800 && codepoint <= 0xDFFF)) {
+      return false;
+    }
+    i += len;
+  }
+  return true;
+}
+
+bool TryConvertUtf16BomToUtf8(const std::string &raw, std::string &out) {
+  if (raw.size() < 2) return false;
+  const unsigned char b0 = static_cast<unsigned char>(raw[0]);
+  const unsigned char b1 = static_cast<unsigned char>(raw[1]);
+  if (b0 == 0xFF && b1 == 0xFE) {
+    std::u16string u16;
+    u16.reserve((raw.size() - 2) / 2);
+    for (size_t i = 2; i + 1 < raw.size(); i += 2) {
+      char16_t ch = static_cast<char16_t>(
+          static_cast<unsigned char>(raw[i]) |
+          (static_cast<unsigned char>(raw[i + 1]) << 8));
+      u16.push_back(ch);
+    }
+    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
+    out = conv.to_bytes(u16);
+    return true;
+  }
+  if (b0 == 0xFE && b1 == 0xFF) {
+    std::u16string u16;
+    u16.reserve((raw.size() - 2) / 2);
+    for (size_t i = 2; i + 1 < raw.size(); i += 2) {
+      char16_t ch = static_cast<char16_t>(
+          (static_cast<unsigned char>(raw[i]) << 8) |
+          static_cast<unsigned char>(raw[i + 1]));
+      u16.push_back(ch);
+    }
+    std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
+    out = conv.to_bytes(u16);
+    return true;
+  }
+  return false;
+}
+
+double ScoreDecodedTextCandidate(const std::string &text) {
+  if (text.empty()) return 0.0;
+  double score = 0.0;
+  size_t total = 0;
+  size_t weird = 0;
+  for (size_t i = 0; i < text.size();) {
+    const unsigned char c = static_cast<unsigned char>(text[i]);
+    size_t len = Utf8CharLen(c);
+    if (i + len > text.size()) {
+      score -= 20.0;
+      ++weird;
+      ++total;
+      break;
+    }
+    uint32_t codepoint = 0;
+    if (len == 1) {
+      codepoint = c;
+    } else {
+      codepoint = c & ((1u << (8 - len - 1)) - 1u);
+      bool invalid = false;
+      for (size_t j = 1; j < len; ++j) {
+        const unsigned char cc = static_cast<unsigned char>(text[i + j]);
+        if ((cc & 0xC0) != 0x80) {
+          invalid = true;
+          break;
+        }
+        codepoint = (codepoint << 6) | (cc & 0x3F);
+      }
+      if (invalid) {
+        score -= 20.0;
+        ++weird;
+        ++total;
+        i += len;
+        continue;
+      }
+    }
+
+    if (codepoint == 0xFFFD) {
+      score -= 18.0;
+      ++weird;
+    } else if (codepoint == '\r' || codepoint == '\n' || codepoint == '\t') {
+      score += 0.4;
+    } else if (codepoint >= 0x20 && codepoint <= 0x7E) {
+      score += 0.8;
+    } else if ((codepoint >= 0x4E00 && codepoint <= 0x9FFF) ||
+               (codepoint >= 0x3400 && codepoint <= 0x4DBF) ||
+               (codepoint >= 0x3040 && codepoint <= 0x30FF) ||
+               (codepoint >= 0xAC00 && codepoint <= 0xD7AF)) {
+      score += 2.4;
+    } else if ((codepoint >= 0x3000 && codepoint <= 0x303F) ||
+               (codepoint >= 0xFF00 && codepoint <= 0xFFEF)) {
+      score += 1.6;
+    } else if (codepoint < 0x20 || (codepoint >= 0x7F && codepoint <= 0x9F)) {
+      score -= 10.0;
+      ++weird;
+    } else {
+      score += 0.2;
+    }
+
+    ++total;
+    i += len;
+  }
+
+  if (total == 0) return -1e9;
+  score -= static_cast<double>(weird) * 1.5;
+  score /= static_cast<double>(total);
+  return score;
+}
+
+#if ROCREADER_HAS_ICONV
+bool TryConvertEncodingToUtf8Iconv(const std::string &raw, const char *from_encoding, std::string &out) {
+  iconv_t cd = iconv_open("UTF-8", from_encoding);
+  if (cd == reinterpret_cast<iconv_t>(-1)) return false;
+  out.clear();
+  size_t in_left = raw.size();
+  char *in_buf = const_cast<char *>(raw.data());
+  std::vector<char> chunk(std::max<size_t>(4096, raw.size() * 4 + 32));
+  while (true) {
+    char *out_buf = chunk.data();
+    size_t out_left = chunk.size();
+    const size_t rc = iconv(cd, &in_buf, &in_left, &out_buf, &out_left);
+    out.append(chunk.data(), chunk.size() - out_left);
+    if (rc != static_cast<size_t>(-1)) break;
+    if (errno == E2BIG) continue;
+    iconv_close(cd);
+    out.clear();
+    return false;
+  }
+  iconv_close(cd);
+  return IsValidUtf8(out);
+}
+#endif
+
+bool DecodeTextBytesToUtf8(const std::string &raw, std::string &out, std::string *detected_encoding = nullptr) {
+  out.clear();
+  if (raw.empty()) {
+    if (detected_encoding) *detected_encoding = "empty";
+    return true;
+  }
+  if (TryConvertUtf16BomToUtf8(raw, out)) {
+    if (detected_encoding) *detected_encoding = "UTF-16";
+    return true;
+  }
+  if (raw.size() >= 3 &&
+      static_cast<unsigned char>(raw[0]) == 0xEF &&
+      static_cast<unsigned char>(raw[1]) == 0xBB &&
+      static_cast<unsigned char>(raw[2]) == 0xBF) {
+    out.assign(raw.begin() + 3, raw.end());
+    if (IsValidUtf8(out)) {
+      if (detected_encoding) *detected_encoding = "UTF-8 BOM";
+      return true;
+    }
+    out.clear();
+  }
+
+  struct Candidate {
+    std::string text;
+    std::string encoding;
+    double score = -1e9;
+  };
+  Candidate best{};
+  bool found_candidate = false;
+
+  auto consider_candidate = [&](std::string candidate_text, const std::string &encoding) {
+    if (!IsValidUtf8(candidate_text)) return;
+    Candidate candidate;
+    candidate.text = std::move(candidate_text);
+    candidate.encoding = encoding;
+    candidate.score = ScoreDecodedTextCandidate(candidate.text);
+    if (!found_candidate || candidate.score > best.score + 0.08 ||
+        (std::abs(candidate.score - best.score) <= 0.08 && encoding == "UTF-8")) {
+      best = std::move(candidate);
+      found_candidate = true;
+    }
+  };
+
+  if (IsValidUtf8(raw)) {
+    consider_candidate(raw, "UTF-8");
+  }
+#if ROCREADER_HAS_ICONV
+  static const std::array<const char *, 4> kLegacyEncodings = {"GB18030", "GBK", "GB2312", "BIG5"};
+  for (const char *encoding : kLegacyEncodings) {
+    std::string converted;
+    if (TryConvertEncodingToUtf8Iconv(raw, encoding, converted)) {
+      consider_candidate(std::move(converted), encoding);
+    }
+  }
+#endif
+  if (!found_candidate) {
+    out.clear();
+    return false;
+  }
+  out = std::move(best.text);
+  if (detected_encoding) *detected_encoding = best.encoding;
+  return true;
+}
+
+bool ReadFileBytes(const std::filesystem::path &path, std::string &raw) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  try {
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    raw = oss.str();
+    return in.good() || in.eof();
+  } catch (...) {
+    raw.clear();
+    return false;
+  }
+}
+
+bool WriteFileBytesAtomically(const std::filesystem::path &path, const std::string &data) {
+  const std::filesystem::path temp_path = path.string() + ".rocreader_tmp";
+  {
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+    if (!out.good()) {
+      out.close();
+      std::error_code cleanup_ec;
+      std::filesystem::remove(temp_path, cleanup_ec);
+      return false;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temp_path, path, ec);
+  if (!ec) return true;
+  ec.clear();
+  std::filesystem::remove(path, ec);
+  ec.clear();
+  std::filesystem::rename(temp_path, path, ec);
+  if (!ec) return true;
+  std::filesystem::remove(temp_path, ec);
+  return false;
+}
+
 } // namespace
 
 int main(int, char **) {
@@ -1813,6 +2106,8 @@ int main(int, char **) {
   load_ui_asset(ui_assets.settings_preview_keyguide, "Menu_Button Instructions.png");
   load_ui_asset(ui_assets.settings_preview_contact, "Menu_Contact Me.png");
   load_ui_asset(ui_assets.settings_preview_clean_history, "Menu_CleanHistory.png");
+  load_ui_asset(ui_assets.settings_preview_clean_cache, "Menu_CleanCache.png");
+  load_ui_asset(ui_assets.settings_preview_txt_to_utf8, "Menu_TXTtoUTF8.png");
   load_ui_asset(ui_assets.settings_preview_exit, "Menu_Exit.png");
   if (!ui_pack_hit.empty()) {
     std::cout << "[native_h700] ui pack: " << ui_pack_hit.string() << " assets=" << packed_ui_assets.size() << "\n";
@@ -1925,7 +2220,17 @@ int main(int, char **) {
   State state = State::Boot;
   State settings_return_state = State::Shelf;
   float boot_timer = 0.0f;
-
+  BootPhase boot_phase = BootPhase::CountBooks;
+  std::vector<std::string> boot_supported_paths;
+  size_t boot_scan_index = 0;
+  std::vector<std::string> boot_cover_generate_queue;
+  size_t boot_cover_generate_index = 0;
+  size_t boot_total_books = 0;
+  std::filesystem::recursive_directory_iterator boot_count_it;
+  std::filesystem::recursive_directory_iterator boot_count_end;
+  size_t boot_count_root_index = 0;
+  bool boot_count_iterator_active = false;
+  std::string boot_status_text = "Loading resources...(0/0)";
   std::vector<BookItem> shelf_items;
   std::unordered_map<std::string, ShelfScanCacheEntry> shelf_scan_cache;
   std::unordered_map<std::string, CoverCacheEntry> cover_textures;
@@ -1956,9 +2261,12 @@ int main(int, char **) {
   std::vector<SettingId> menu_items = {
       SettingId::KeyGuide,
       SettingId::ClearHistory,
+      SettingId::CleanCache,
+      SettingId::TxtToUtf8,
       SettingId::ContactMe,
       SettingId::ExitApp};
   int menu_selected = 0;
+  TxtTranscodeJob txt_transcode_job{};
 
   std::string current_book;
   ReaderProgress reader{};
@@ -2246,14 +2554,6 @@ int main(int, char **) {
     ++shelf_content_version;
   };
 
-  rebuild_shelf_items();
-  std::cout << "[native_h700] shelf items: " << shelf_items.size() << "\n";
-  for (size_t i = 0; i < shelf_items.size() && i < 12; ++i) {
-    std::cout << "[native_h700] item[" << i << "] "
-              << (shelf_items[i].is_dir ? "[DIR] " : "[BOOK] ")
-              << shelf_items[i].name << " | " << shelf_items[i].path << "\n";
-  }
-
   auto prune_cover_cache = [&]() {
     auto cover_cache_total_bytes = [&]() -> size_t {
       size_t total = 0;
@@ -2283,6 +2583,20 @@ int main(int, char **) {
     }
     cover_textures.clear();
     ++shelf_content_version;
+  };
+
+  auto clear_directory_files = [&](const std::filesystem::path &dir_path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(dir_path, ec) || ec) return;
+    const auto opts = std::filesystem::directory_options::skip_permission_denied;
+    for (std::filesystem::directory_iterator it(dir_path, opts, ec), end; it != end; it.increment(ec)) {
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      std::filesystem::remove_all(it->path(), ec);
+      ec.clear();
+    }
   };
 
   auto make_pdf_cover_cache_key = [&](const std::string &doc_path) {
@@ -2497,6 +2811,21 @@ int main(int, char **) {
     return nullptr;
   };
 
+  auto has_manual_cover_exact_or_fuzzy = [&](const BookItem &item) -> bool {
+    const std::string exact_cover_path =
+        cover_resolver::ResolveCoverPathExact(item.path, item.is_dir, cover_roots);
+    if (!exact_cover_path.empty()) return true;
+    const std::string fuzzy_cover_path =
+        cover_resolver::ResolveCoverPathFuzzy(item.path, item.is_dir, cover_roots);
+    return !fuzzy_cover_path.empty();
+  };
+
+  auto has_cached_pdf_cover_on_disk = [&](const std::string &doc_path) -> bool {
+    std::error_code ec;
+    const std::filesystem::path cache_file = get_pdf_cover_cache_file(doc_path);
+    return std::filesystem::exists(cache_file, ec) && !ec;
+  };
+
   auto load_manual_cover_exact_then_fuzzy = [&](const BookItem &item) -> SDL_Texture * {
     const std::string exact_cover_path =
         cover_resolver::ResolveCoverPathExact(item.path, item.is_dir, cover_roots);
@@ -2635,7 +2964,10 @@ int main(int, char **) {
 
   auto clear_text_cache = [&]() {
     for (auto &kv : text_cache) {
-      if (kv.second.texture) SDL_DestroyTexture(kv.second.texture);
+      if (kv.second.texture) {
+        forget_texture_size(kv.second.texture);
+        SDL_DestroyTexture(kv.second.texture);
+      }
     }
     text_cache.clear();
     title_ellipsize_cache.clear();
@@ -3045,6 +3377,99 @@ int main(int, char **) {
 
 #endif
 
+  auto clear_runtime_cache_files = [&]() {
+    clear_cover_cache();
+    clear_directory_files(cover_thumb_cache_dir);
+#ifdef HAVE_SDL2_TTF
+    txt_layout_cache.clear();
+    clear_text_cache();
+#endif
+    clear_directory_files(txt_layout_cache_dir);
+    std::cout << "[native_h700] runtime caches cleared: cover thumbs + txt layouts/resume\n";
+  };
+
+  auto collect_scanned_txt_files = [&]() {
+    std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
+    for (const auto &root : books_roots) {
+      std::error_code ec;
+      if (!std::filesystem::exists(root, ec) || ec) continue;
+      const auto opts = std::filesystem::directory_options::skip_permission_denied;
+      for (std::filesystem::recursive_directory_iterator it(root, opts, ec), end; it != end; it.increment(ec)) {
+        if (ec) {
+          ec.clear();
+          continue;
+        }
+        if (!it->is_regular_file(ec) || ec) {
+          ec.clear();
+          continue;
+        }
+        const std::string path = it->path().string();
+        if (GetLowerExt(path) != ".txt") continue;
+        const std::string key = NormalizePathKey(path);
+        if (seen.insert(key).second) out.push_back(path);
+      }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+
+  auto start_txt_transcode_job = [&]() {
+    if (txt_transcode_job.active) return;
+    txt_transcode_job = TxtTranscodeJob{};
+    txt_transcode_job.files = collect_scanned_txt_files();
+    txt_transcode_job.total = txt_transcode_job.files.size();
+    txt_transcode_job.active = txt_transcode_job.total > 0;
+    txt_transcode_job.current_file.clear();
+    std::cout << "[native_h700] txt transcode queued: files=" << txt_transcode_job.total << "\n";
+  };
+
+  auto process_txt_transcode_step = [&]() {
+    if (!txt_transcode_job.active) return;
+    if (txt_transcode_job.processed >= txt_transcode_job.total) {
+      txt_transcode_job.active = false;
+      txt_transcode_job.current_file.clear();
+      clear_runtime_cache_files();
+      std::cout << "[native_h700] txt transcode finished: processed=" << txt_transcode_job.processed
+                << " converted=" << txt_transcode_job.converted
+                << " failed=" << txt_transcode_job.failed << "\n";
+      return;
+    }
+
+    const size_t idx = txt_transcode_job.processed;
+    const std::filesystem::path file_path(txt_transcode_job.files[idx]);
+    txt_transcode_job.current_file = file_path.filename().string();
+
+    std::string raw;
+    std::string utf8;
+    std::string detected_encoding;
+    bool success = ReadFileBytes(file_path, raw) && DecodeTextBytesToUtf8(raw, utf8, &detected_encoding);
+    bool converted = false;
+    if (success) {
+      if (utf8 != raw) {
+        success = WriteFileBytesAtomically(file_path, utf8);
+        converted = success;
+      }
+    }
+    if (!success) {
+      ++txt_transcode_job.failed;
+      std::cout << "[native_h700] txt transcode failed: " << file_path.string() << "\n";
+    } else if (converted) {
+      ++txt_transcode_job.converted;
+      std::cout << "[native_h700] txt transcoded: " << file_path.string()
+                << " encoding=" << detected_encoding << "\n";
+    }
+    ++txt_transcode_job.processed;
+    if (txt_transcode_job.processed >= txt_transcode_job.total) {
+      txt_transcode_job.active = false;
+      txt_transcode_job.current_file.clear();
+      clear_runtime_cache_files();
+      std::cout << "[native_h700] txt transcode finished: processed=" << txt_transcode_job.processed
+                << " converted=" << txt_transcode_job.converted
+                << " failed=" << txt_transcode_job.failed << "\n";
+    }
+  };
+
   auto destroy_render_cache = [&](ReaderRenderCache &cache) {
     if (cache.texture) {
       forget_texture_size(cache.texture);
@@ -3156,12 +3581,7 @@ int main(int, char **) {
   auto ensure_render = [&]() {
     if (!reader_is_open()) return false;
     const int page = reader_current_page();
-    const float requested_scale = std::max(0.1f, std::min(6.0f, get_auto_scale() * reader.zoom));
-    float final_scale = requested_scale;
-    auto cap_it = pdf_render_scale_caps.find(page);
-    if (cap_it != pdf_render_scale_caps.end() && cap_it->second > 0.0f) {
-      final_scale = std::min(final_scale, cap_it->second);
-    }
+    float final_scale = std::max(0.1f, std::min(6.0f, get_auto_scale() * reader.zoom));
     if (render_cache.texture && render_cache.page == page && render_cache.rotation == reader.rotation &&
         std::abs(render_cache.scale - final_scale) < 0.0005f) {
       render_cache.last_use = SDL_GetTicks();
@@ -3195,11 +3615,6 @@ int main(int, char **) {
       rendered_scale = std::max(0.1f, rendered_scale * 0.7f);
     }
     if (!rendered) return false;
-    if (rendered_scale + 0.0005f < requested_scale) {
-      pdf_render_scale_caps[page] = rendered_scale;
-    } else {
-      pdf_render_scale_caps.erase(page);
-    }
 
     // Software rotate to keep scroll-axis math straightforward.
     int rw = sw, rh = sh;
@@ -3411,7 +3826,8 @@ int main(int, char **) {
   };
 
 #ifdef HAVE_SDL2_TTF
-  const std::string kTxtParagraphIndent = u8"　　";
+  const std::string kTxtParagraphIndent = u8"銆€銆€";
+  const std::string kTxtParagraphIndentAscii = "  ";
 
   auto normalize_text_paragraph = [&](const std::string &line) -> std::string {
     auto is_ignorable_at = [&](size_t pos, size_t &len) -> bool {
@@ -3461,7 +3877,7 @@ int main(int, char **) {
     }
 
     if (end <= start) return "";
-    return kTxtParagraphIndent + line.substr(start, end - start);
+    return kTxtParagraphIndentAscii + line.substr(start, end - start);
   };
 
   auto wrap_text_line = [&](const std::string &line, int max_width_px) -> std::vector<std::string> {
@@ -3766,39 +4182,9 @@ int main(int, char **) {
     if (raw.size() >= kTxtMaxBytes) {
       truncated = true;
     }
-    // UTF-16 BOM handling (common in exported TXT files).
-    if (raw.size() >= 2) {
-      const unsigned char b0 = static_cast<unsigned char>(raw[0]);
-      const unsigned char b1 = static_cast<unsigned char>(raw[1]);
-      if (b0 == 0xFF && b1 == 0xFE) {
-        std::u16string u16;
-        u16.reserve((raw.size() - 2) / 2);
-        for (size_t i = 2; i + 1 < raw.size(); i += 2) {
-          char16_t ch = static_cast<char16_t>(
-              static_cast<unsigned char>(raw[i]) |
-              (static_cast<unsigned char>(raw[i + 1]) << 8));
-          u16.push_back(ch);
-        }
-        std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
-        raw = conv.to_bytes(u16);
-      } else if (b0 == 0xFE && b1 == 0xFF) {
-        std::u16string u16;
-        u16.reserve((raw.size() - 2) / 2);
-        for (size_t i = 2; i + 1 < raw.size(); i += 2) {
-          char16_t ch = static_cast<char16_t>(
-              (static_cast<unsigned char>(raw[i]) << 8) |
-              static_cast<unsigned char>(raw[i + 1]));
-          u16.push_back(ch);
-        }
-        std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> conv;
-        raw = conv.to_bytes(u16);
-      }
-    }
-    if (raw.size() >= 3 &&
-        static_cast<unsigned char>(raw[0]) == 0xEF &&
-        static_cast<unsigned char>(raw[1]) == 0xBB &&
-        static_cast<unsigned char>(raw[2]) == 0xBF) {
-      raw.erase(0, 3);
+    std::string decoded;
+    if (DecodeTextBytesToUtf8(raw, decoded)) {
+      raw = std::move(decoded);
     }
     next.pending_raw = std::move(raw);
     next.pending_line.reserve(256);
@@ -3841,6 +4227,54 @@ int main(int, char **) {
     text_scroll_by(dir * step);
   };
 
+  auto start_next_boot_count_root = [&]() -> bool {
+    const auto opts = std::filesystem::directory_options::skip_permission_denied;
+    while (boot_count_root_index < books_roots.size()) {
+      const std::filesystem::path root_path(books_roots[boot_count_root_index++]);
+      std::error_code ec;
+      if (!std::filesystem::exists(root_path, ec) || !std::filesystem::is_directory(root_path, ec)) continue;
+      boot_count_it = std::filesystem::recursive_directory_iterator(root_path, opts, ec);
+      if (ec) continue;
+      boot_count_end = std::filesystem::recursive_directory_iterator();
+      boot_count_iterator_active = true;
+      return true;
+    }
+    boot_count_iterator_active = false;
+    return false;
+  };
+
+  auto boot_progress_ratio = [&]() -> float {
+    switch (boot_phase) {
+    case BootPhase::CountBooks: {
+      const float pulse = std::fmod(boot_timer * 0.85f, 1.0f);
+      return 0.05f + pulse * 0.15f;
+    }
+    case BootPhase::ScanBooks:
+      return boot_total_books == 0 ? 0.55f
+                                   : (0.20f + 0.35f * (static_cast<float>(boot_scan_index) /
+                                                       static_cast<float>(std::max<size_t>(1, boot_total_books))));
+    case BootPhase::GenerateCovers:
+      return boot_cover_generate_queue.empty()
+                 ? 1.0f
+                 : (0.55f + 0.45f * (static_cast<float>(boot_cover_generate_index) /
+                                     static_cast<float>(std::max<size_t>(1, boot_cover_generate_queue.size()))));
+    case BootPhase::Finalize:
+    case BootPhase::Done:
+      return 1.0f;
+    }
+    return 0.0f;
+  };
+
+  auto make_boot_scan_text = [&](size_t current, size_t total) {
+    return std::string(u8"\u8d44\u6e90\u52a0\u8f7d\u4e2d...\uff08") + std::to_string(current) + "/" +
+           std::to_string(total) + u8"\uff09";
+  };
+
+  auto make_boot_cover_text = [&](size_t current, size_t total) {
+    return std::string(u8"\u5c01\u9762\u7f13\u5b58\u751f\u6210\u4e2d...\uff08") + std::to_string(current) + "/" +
+           std::to_string(total) + u8"\uff09";
+  };
+
   bool running = true;
   uint32_t prev_ticks = SDL_GetTicks();
   while (running) {
@@ -3857,6 +4291,7 @@ int main(int, char **) {
     const bool animate_enabled = config.Get().animations;
     const bool has_active_animation =
         state == State::Boot || input.AnyPressed() ||
+        txt_transcode_job.active ||
         (reader_mode == ReaderMode::Txt && txt_reader.open && txt_reader.loading) ||
         (animate_enabled && (menu_anim.IsAnimating() || scene_flash.IsAnimating() || page_animating || any_grid_animating));
     const bool needs_periodic_tick = (state == State::Shelf && title_marquee_active);
@@ -3901,6 +4336,7 @@ int main(int, char **) {
       clamp_text_scroll();
       persist_current_txt_resume_snapshot(current_book, false);
     }
+    process_txt_transcode_step();
     flush_deferred_writes(false);
 
     const bool vol_up_pressed = input.IsJustPressed(Button::VolUp) || input.IsRepeated(Button::VolUp);
@@ -4008,7 +4444,107 @@ int main(int, char **) {
 
     if (state == State::Boot) {
       boot_timer += dt;
-      if (boot_timer >= 0.7f) state = State::Shelf;
+      if (boot_phase == BootPhase::CountBooks) {
+        if (!boot_count_iterator_active) {
+          start_next_boot_count_root();
+        }
+        size_t processed = 0;
+        while (processed < kBootCountBatchEntries) {
+          if (!boot_count_iterator_active) {
+            if (!start_next_boot_count_root()) break;
+          }
+          if (boot_count_it == boot_count_end) {
+            boot_count_iterator_active = false;
+            continue;
+          }
+          std::error_code ec;
+          const auto entry = *boot_count_it;
+          boot_count_it.increment(ec);
+          ++processed;
+          if (ec || !entry.is_regular_file(ec)) continue;
+          const std::string ext = GetLowerExt(entry.path().string());
+          if (ext == ".pdf" || ext == ".txt") {
+            boot_supported_paths.push_back(entry.path().string());
+          }
+        }
+        boot_status_text = make_boot_scan_text(0, 0);
+        if (!boot_count_iterator_active && boot_count_root_index >= books_roots.size()) {
+          std::sort(boot_supported_paths.begin(), boot_supported_paths.end());
+          boot_total_books = boot_supported_paths.size();
+          boot_scan_index = 0;
+          boot_cover_generate_queue.clear();
+          boot_phase = BootPhase::ScanBooks;
+          boot_status_text = make_boot_scan_text(0, boot_total_books);
+        }
+      } else if (boot_phase == BootPhase::ScanBooks) {
+        size_t processed = 0;
+        while (processed < kBootScanBatchEntries && boot_scan_index < boot_supported_paths.size()) {
+          const std::string &book_path = boot_supported_paths[boot_scan_index];
+          const std::string ext = GetLowerExt(book_path);
+          if (ext == ".pdf") {
+            BookItem item;
+            item.name = std::filesystem::path(book_path).filename().string();
+            item.path = book_path;
+            item.is_dir = false;
+            if (!has_manual_cover_exact_or_fuzzy(item) &&
+                !has_cached_pdf_cover_on_disk(book_path) &&
+                pdf.HasRealRenderer()) {
+              boot_cover_generate_queue.push_back(book_path);
+            }
+          }
+          ++boot_scan_index;
+          ++processed;
+        }
+        boot_status_text = make_boot_scan_text(boot_scan_index, boot_total_books);
+        if (boot_scan_index >= boot_supported_paths.size()) {
+          boot_cover_generate_index = 0;
+          boot_phase = BootPhase::GenerateCovers;
+          boot_status_text = make_boot_cover_text(0, boot_cover_generate_queue.size());
+          if (boot_cover_generate_queue.empty()) {
+            boot_phase = BootPhase::Finalize;
+          }
+        }
+      } else if (boot_phase == BootPhase::GenerateCovers) {
+        size_t processed = 0;
+        while (processed < kBootCoverGenerateBatchEntries &&
+               boot_cover_generate_index < boot_cover_generate_queue.size()) {
+          const std::string &doc_path = boot_cover_generate_queue[boot_cover_generate_index];
+          if (SDL_Texture *generated = create_doc_first_page_cover_texture(doc_path)) {
+            forget_texture_size(generated);
+            SDL_DestroyTexture(generated);
+          }
+          ++boot_cover_generate_index;
+          ++processed;
+        }
+        boot_status_text = make_boot_cover_text(boot_cover_generate_index, boot_cover_generate_queue.size());
+        if (boot_cover_generate_index >= boot_cover_generate_queue.size()) {
+          boot_phase = BootPhase::Finalize;
+        }
+      }
+      if (boot_phase == BootPhase::Finalize) {
+        current_folder.clear();
+        nav_selected_index = 0;
+        rebuild_shelf_items();
+        focus_index = 0;
+        shelf_page = 0;
+        page_animating = false;
+        page_slide.Snap(0.0f);
+        grid_item_anims.clear();
+        title_focus_index = -1;
+        title_marquee_active = false;
+        title_marquee_offset = 0.0f;
+        title_marquee_wait = kTitleMarqueePauseSec;
+        std::cout << "[native_h700] boot scan complete: books=" << boot_total_books
+                  << " cover_generate=" << boot_cover_generate_queue.size() << "\n";
+        state = State::Shelf;
+        boot_phase = BootPhase::Done;
+        std::cout << "[native_h700] shelf items: " << shelf_items.size() << "\n";
+        for (size_t i = 0; i < shelf_items.size() && i < 12; ++i) {
+          std::cout << "[native_h700] item[" << i << "] "
+                    << (shelf_items[i].is_dir ? "[DIR] " : "[BOOK] ")
+                    << shelf_items[i].name << " | " << shelf_items[i].path << "\n";
+        }
+      }
     } else if (state == State::Shelf) {
       const NativeConfig &ui_cfg = config.Get();
       const int prev_page = shelf_page;
@@ -4286,6 +4822,10 @@ int main(int, char **) {
               page_slide.Snap(0.0f);
               grid_item_anims.clear();
             }
+          } else if (id == SettingId::CleanCache) {
+            clear_runtime_cache_files();
+          } else if (id == SettingId::TxtToUtf8) {
+            start_txt_transcode_job();
           }
         }
         if (menu_selected != prev_menu_selected) {
@@ -4303,7 +4843,9 @@ int main(int, char **) {
           txt_reader.resume_cache_dirty = true;
           persist_current_txt_resume_snapshot(current_book, true);
         }
-        progress.Set(current_book, reader);
+        ReaderProgress save_reader = reader;
+        if (reader_mode == ReaderMode::Pdf) save_reader.rotation = 0;
+        progress.Set(current_book, save_reader);
         if (reader_mode == ReaderMode::Pdf) {
           pdf.Close();
           pdf_page_size_cache.clear();
@@ -4444,8 +4986,23 @@ int main(int, char **) {
 
     if (state == State::Boot) {
       DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{20, 20, 24, 255});
-      int w = static_cast<int>(std::round(std::min(1.0f, boot_timer / 0.7f) * (Layout().screen_w - 80)));
-      DrawRect(renderer, 40, Layout().screen_h / 2, w, 16, SDL_Color{210, 210, 210, 255});
+      const int bar_x = 40;
+      const int bar_y = Layout().screen_h / 2;
+      const int bar_w = Layout().screen_w - 80;
+      const float progress = std::clamp(boot_progress_ratio(), 0.0f, 1.0f);
+      const int fill_w = static_cast<int>(std::round(progress * bar_w));
+      DrawRect(renderer, bar_x, bar_y, bar_w, 16, SDL_Color{48, 52, 60, 255});
+      DrawRect(renderer, bar_x, bar_y, fill_w, 16, SDL_Color{210, 210, 210, 255});
+      DrawRect(renderer, bar_x, bar_y, bar_w, 16, SDL_Color{255, 255, 255, 220}, false);
+#ifdef HAVE_SDL2_TTF
+      SDL_Color boot_text_color{232, 236, 244, 255};
+      if (!boot_status_text.empty()) {
+        if (TextCacheEntry *te = get_text_texture(boot_status_text, boot_text_color); te && te->texture) {
+          SDL_Rect td{std::max(0, (Layout().screen_w - te->w) / 2), bar_y + 28, te->w, te->h};
+          SDL_RenderCopy(renderer, te->texture, nullptr, &td);
+        }
+      }
+#endif
     } else {
       const NativeConfig &cfg = config.Get();
       const SDL_Color bg = (cfg.theme == 0) ? SDL_Color{22, 23, 29, 255} : SDL_Color{238, 237, 233, 255};
@@ -4745,10 +5302,10 @@ int main(int, char **) {
             } else {
               forget_texture_size(cache_tex);
               SDL_DestroyTexture(cache_tex);
-              SDL_SetRenderTarget(renderer, nullptr);
               render_shelf_static_layer();
             }
           } else {
+            invalidate_shelf_render_cache();
             render_shelf_static_layer();
           }
         } else {
@@ -4864,11 +5421,14 @@ int main(int, char **) {
         DrawRect(renderer, x, menu_y, menu_width, menu_h, SDL_Color{0, 0, 0, static_cast<Uint8>(eased * kSidebarMaskMaxAlpha)});
         const int preview_x = x + menu_width;
         const int preview_w = std::max(0, Layout().screen_w - preview_x);
+        int preview_center_x = preview_x + preview_w / 2;
         if (preview_w > 0) {
           SDL_Texture *preview_tex = nullptr;
           const SettingId selected = menu_items[ClampInt(menu_selected, 0, static_cast<int>(menu_items.size()) - 1)];
           if (selected == SettingId::KeyGuide) preview_tex = ui_assets.settings_preview_keyguide;
           else if (selected == SettingId::ClearHistory) preview_tex = ui_assets.settings_preview_clean_history;
+          else if (selected == SettingId::CleanCache) preview_tex = ui_assets.settings_preview_clean_cache;
+          else if (selected == SettingId::TxtToUtf8) preview_tex = ui_assets.settings_preview_txt_to_utf8;
           else if (selected == SettingId::ContactMe) preview_tex = ui_assets.settings_preview_contact;
           else if (selected == SettingId::ExitApp) preview_tex = ui_assets.settings_preview_exit;
 
@@ -4878,6 +5438,7 @@ int main(int, char **) {
             get_texture_size(preview_tex, pw, ph);
             SDL_Rect pd{preview_x, menu_y, pw, ph};
             SDL_RenderCopy(renderer, preview_tex, nullptr, &pd);
+            preview_center_x = pd.x + pd.w / 2;
           }
         }
         DrawRect(renderer, x, menu_y, menu_width, menu_h, SDL_Color{24, 34, 46, 236});
@@ -4885,16 +5446,16 @@ int main(int, char **) {
         int text_left = x + 32;
         int y = menu_y + 84 + Layout().settings_content_offset_y;
 #ifdef HAVE_SDL2_TTF
-        const std::string menu_title = u8"ROC全能漫画阅读器";
+        const std::string menu_title = std::string(u8"ROC\u5168\u80fd\u6f2b\u753b\u9605\u8bfb\u5668");
         SDL_Color title_color{240, 246, 255, 255};
         SDL_Color item_color{230, 236, 248, 255};
         TextCacheEntry *title_tex = get_title_text_texture(menu_title, title_color);
         int divider_y = menu_y + 68 + Layout().settings_content_offset_y;
         if (title_tex && title_tex->texture) {
           const int side_margin = std::max(0, (menu_width - title_tex->w) / 2);
-          const int title_x = x + side_margin; // keep equal left/right margin
-          const int title_y = menu_y + side_margin + Layout().settings_content_offset_y; // top margin equals side margin
-          const int title_gap = side_margin;   // title->divider gap equals top/side margin
+          const int title_x = x + side_margin;
+          const int title_y = menu_y + side_margin + Layout().settings_content_offset_y;
+          const int title_gap = side_margin;
           divider_y = title_y + title_tex->h + title_gap;
           SDL_Rect td{title_x, title_y, title_tex->w, title_tex->h};
           SDL_RenderCopy(renderer, title_tex->texture, nullptr, &td);
@@ -4902,7 +5463,6 @@ int main(int, char **) {
         DrawRect(renderer, x + 8, divider_y, menu_width - 16, 1, SDL_Color{66, 95, 124, 255});
         y = divider_y + 12;
         text_left = x + 32;
-        const std::array<std::string, 4> menu_labels = {u8"按键说明", u8"清除历史", u8"联系我", u8"退出"};
 #else
         DrawRect(renderer,
                  x + 8,
@@ -4910,7 +5470,6 @@ int main(int, char **) {
                  menu_width - 16,
                  1,
                  SDL_Color{66, 95, 124, 255});
-        const std::array<std::string, 4> menu_labels = {"KEY GUIDE", "CLEAR HISTORY", "CONTACT", "EXIT"};
 #endif
         for (size_t i = 0; i < menu_items.size(); ++i) {
           const bool sel = (static_cast<int>(i) == menu_selected);
@@ -4921,8 +5480,17 @@ int main(int, char **) {
             DrawRect(renderer, x + 11, y - 1, menu_width - 22, 32, SDL_Color{85, 152, 198, 208}, false);
           }
 #ifdef HAVE_SDL2_TTF
-          if (i < menu_labels.size()) {
-            TextCacheEntry *label_tex = get_text_texture(menu_labels[i], item_color);
+          std::string label_text;
+          switch (menu_items[i]) {
+          case SettingId::KeyGuide: label_text = std::string(u8"\u6309\u952e\u8bf4\u660e"); break;
+          case SettingId::ClearHistory: label_text = std::string(u8"\u6e05\u9664\u5386\u53f2"); break;
+          case SettingId::CleanCache: label_text = std::string(u8"\u6e05\u9664\u7f13\u5b58"); break;
+          case SettingId::TxtToUtf8: label_text = std::string(u8"TXT\u8f6c\u7801"); break;
+          case SettingId::ContactMe: label_text = std::string(u8"\u8054\u7cfb\u6211"); break;
+          case SettingId::ExitApp: label_text = std::string(u8"\u9000\u51fa"); break;
+          }
+          if (!label_text.empty()) {
+            TextCacheEntry *label_tex = get_text_texture(label_text, item_color);
             if (label_tex && label_tex->texture) {
               const int ty = y + std::max(0, (30 - label_tex->h) / 2);
               SDL_Rect td{text_left, ty, label_tex->w, label_tex->h};
@@ -4931,6 +5499,41 @@ int main(int, char **) {
           }
 #endif
           y += 42;
+        }
+
+        const SettingId selected = menu_items[ClampInt(menu_selected, 0, static_cast<int>(menu_items.size()) - 1)];
+        if (selected == SettingId::TxtToUtf8 && txt_transcode_job.active) {
+          const int bar_w = std::min(260, std::max(160, preview_w - 36));
+          const int bar_h = 14;
+          const int bar_x = ClampInt(preview_center_x - bar_w / 2, preview_x + 8, preview_x + std::max(8, preview_w - bar_w - 8));
+          const int bar_y = 308;
+          const float progress =
+              (txt_transcode_job.total > 0)
+                  ? static_cast<float>(txt_transcode_job.processed) / static_cast<float>(txt_transcode_job.total)
+                  : 0.0f;
+          const int fill_w = ClampInt(static_cast<int>(std::lround(bar_w * progress)), 0, bar_w);
+          DrawRect(renderer, bar_x, bar_y, bar_w, bar_h, SDL_Color{46, 52, 62, 224});
+          DrawRect(renderer, bar_x, bar_y, fill_w, bar_h, SDL_Color{63, 119, 158, 255});
+          DrawRect(renderer, bar_x, bar_y, bar_w, bar_h, SDL_Color{255, 255, 255, 210}, false);
+#ifdef HAVE_SDL2_TTF
+          const int pct = ClampInt(static_cast<int>(std::lround(progress * 100.0f)), 0, 100);
+          std::string progress_text = std::string(u8"\u8f6c\u7801\u4e2d ") + std::to_string(txt_transcode_job.processed) +
+                                      "/" + std::to_string(txt_transcode_job.total) +
+                                      "  (" + std::to_string(pct) + "%)";
+          TextCacheEntry *progress_tex = get_text_texture(progress_text, SDL_Color{245, 248, 252, 255});
+          if (progress_tex && progress_tex->texture) {
+            SDL_Rect pd{preview_center_x - progress_tex->w / 2, bar_y + bar_h + 10, progress_tex->w, progress_tex->h};
+            SDL_RenderCopy(renderer, progress_tex->texture, nullptr, &pd);
+          }
+          if (!txt_transcode_job.current_file.empty()) {
+            const std::string file_text = Utf8Ellipsize(txt_transcode_job.current_file, 24);
+            TextCacheEntry *file_tex = get_text_texture(file_text, SDL_Color{184, 197, 212, 255});
+            if (file_tex && file_tex->texture) {
+              SDL_Rect fd{preview_center_x - file_tex->w / 2, bar_y + bar_h + 32, file_tex->w, file_tex->h};
+              SDL_RenderCopy(renderer, file_tex->texture, nullptr, &fd);
+            }
+          }
+#endif
         }
 
         // Status bars must stay on top, even over settings menu.
@@ -5001,7 +5604,9 @@ int main(int, char **) {
       current_book.clear();
     }
     if (!current_book.empty()) {
-      progress.Set(current_book, reader);
+      ReaderProgress save_reader = reader;
+      if (reader_mode == ReaderMode::Pdf) save_reader.rotation = 0;
+      progress.Set(current_book, save_reader);
       history_store.Add(current_book);
     }
   }
@@ -5024,6 +5629,8 @@ int main(int, char **) {
   if (ui_assets.settings_preview_keyguide) SDL_DestroyTexture(ui_assets.settings_preview_keyguide);
   if (ui_assets.settings_preview_contact) SDL_DestroyTexture(ui_assets.settings_preview_contact);
   if (ui_assets.settings_preview_clean_history) SDL_DestroyTexture(ui_assets.settings_preview_clean_history);
+  if (ui_assets.settings_preview_clean_cache) SDL_DestroyTexture(ui_assets.settings_preview_clean_cache);
+  if (ui_assets.settings_preview_txt_to_utf8) SDL_DestroyTexture(ui_assets.settings_preview_txt_to_utf8);
   if (ui_assets.settings_preview_exit) SDL_DestroyTexture(ui_assets.settings_preview_exit);
 #ifdef HAVE_SDL2_TTF
   clear_text_cache();
