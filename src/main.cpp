@@ -40,10 +40,18 @@
 #include "book_scanner.h"
 #include "cover_resolver.h"
 #include "epub_comic_reader.h"
+#include "epub_runtime.h"
 #include "epub_reader.h"
+#include "input_manager.h"
 #include "pdf_reader.h"
 #include "pdf_runtime.h"
+#include "progress_store.h"
+#include "reader_core.h"
+#include "reader_session_ops.h"
+#include "reader_session_state.h"
 #include "storage_paths.h"
+#include "txt_reader_session.h"
+#include "txt_reader_runtime.h"
 #include "animation.h"
 
 namespace {
@@ -139,7 +147,6 @@ constexpr float kCoverAspect = 2.0f / 3.0f;
 constexpr Uint8 kUnfocusedAlpha = 255;
 constexpr float kTitleMarqueePauseSec = 0.75f;
 constexpr float kTitleMarqueeSpeedPx = 48.0f;
-constexpr int kButtonCount = 17;
 constexpr size_t kCoverCacheMaxEntries = 160;
 constexpr size_t kCoverCacheMaxBytes = 24u * 1024u * 1024u;
 constexpr Uint8 kSidebarMaskMaxAlpha = 84;
@@ -198,84 +205,7 @@ std::string NormalizePathKey(const std::string &path);
 enum class State { Boot, Shelf, Settings, Reader };
 enum class BootPhase { CountBooks, ScanBooks, GenerateCovers, Finalize, Done };
 
-enum class Button {
-  Up,
-  Down,
-  Left,
-  Right,
-  A,
-  B,
-  X,
-  Y,
-  Menu,
-  L1,
-  L2,
-  R1,
-  R2,
-  Start,
-  Select,
-  VolUp,
-  VolDown,
-};
-
-const char *ButtonName(Button b) {
-  switch (b) {
-  case Button::Up: return "Up";
-  case Button::Down: return "Down";
-  case Button::Left: return "Left";
-  case Button::Right: return "Right";
-  case Button::A: return "A";
-  case Button::B: return "B";
-  case Button::X: return "X";
-  case Button::Y: return "Y";
-  case Button::Menu: return "Menu";
-  case Button::L1: return "L1";
-  case Button::L2: return "L2";
-  case Button::R1: return "R1";
-  case Button::R2: return "R2";
-  case Button::Start: return "Start";
-  case Button::Select: return "Select";
-  case Button::VolUp: return "VolUp";
-  case Button::VolDown: return "VolDown";
-  default: return "Invalid";
-  }
-}
-
-const char *SdlEventName(Uint32 type) {
-  switch (type) {
-  case SDL_KEYDOWN: return "SDL_KEYDOWN";
-  case SDL_KEYUP: return "SDL_KEYUP";
-  case SDL_CONTROLLERBUTTONDOWN: return "SDL_CONTROLLERBUTTONDOWN";
-  case SDL_CONTROLLERBUTTONUP: return "SDL_CONTROLLERBUTTONUP";
-  case SDL_CONTROLLERAXISMOTION: return "SDL_CONTROLLERAXISMOTION";
-  case SDL_JOYBUTTONDOWN: return "SDL_JOYBUTTONDOWN";
-  case SDL_JOYBUTTONUP: return "SDL_JOYBUTTONUP";
-  case SDL_JOYHATMOTION: return "SDL_JOYHATMOTION";
-  case SDL_JOYAXISMOTION: return "SDL_JOYAXISMOTION";
-  default: return "SDL_EVENT_UNKNOWN";
-  }
-}
-
 enum class SettingId { KeyGuide, ClearHistory, CleanCache, TxtToUtf8, ContactMe, ExitApp };
-
-struct BtnState {
-  bool down = false;
-  bool just_pressed = false;
-  bool just_released = false;
-  bool repeated = false;
-  bool long_pressed = false;
-  float hold_time = 0.0f;
-  float repeat_timer = 0.0f;
-  bool repeat_active = false;
-};
-
-struct ReaderProgress {
-  int page = 0;
-  int rotation = 0;
-  float zoom = 1.0f;
-  int scroll_x = 0;
-  int scroll_y = 0;
-};
 
 struct NativeConfig {
   int theme = 0;
@@ -597,160 +527,6 @@ enum class ShelfCategory {
   History = 3,
 };
 
-enum class ReaderMode {
-  None = 0,
-  Pdf = 1,
-  Txt = 2,
-  Epub = 3,
-};
-
-enum class ReaderRenderQuality {
-  Low = 0,
-  Full = 1,
-};
-
-struct ReaderRenderCache {
-  int page = -1;
-  int rotation = 0;
-  float scale = 1.0f;
-  ReaderRenderQuality quality = ReaderRenderQuality::Full;
-  SDL_Texture *texture = nullptr;
-  int w = 0;
-  int h = 0;
-  int display_w = 0;
-  int display_h = 0;
-  uint32_t last_use = 0;
-};
-
-struct ReaderPageRenderMode {
-  int display_w = 0;
-  int display_h = 0;
-};
-
-struct ReaderViewState {
-  int page = 0;
-  float zoom = 1.0f;
-  int rotation = 0;
-
-  bool operator==(const ReaderViewState &other) const {
-    return page == other.page &&
-           rotation == other.rotation &&
-           std::abs(zoom - other.zoom) < 0.0005f;
-  }
-
-  bool operator!=(const ReaderViewState &other) const { return !(*this == other); }
-};
-
-struct ReaderAdaptiveRenderState {
-  uint32_t last_page_flip_tick = 0;
-  bool pending_page_active = false;
-  int pending_page = -1;
-  bool pending_page_top = true;
-  uint32_t pending_page_commit_tick = 0;
-  bool fast_flip_mode = false;
-  int last_scroll_dir = 1;
-};
-
-struct ReaderAsyncRenderJob {
-  bool active = false;
-  bool prefetch = false;
-  ReaderMode mode = ReaderMode::None;
-  std::string path;
-  ReaderViewState state;
-  int page = 0;
-  float target_scale = 1.0f;
-  int rotation = 0;
-  int display_w = 0;
-  int display_h = 0;
-  uint64_t serial = 0;
-};
-
-struct ReaderAsyncRenderResult {
-  bool ready = false;
-  bool success = false;
-  ReaderMode mode = ReaderMode::None;
-  std::string path;
-  ReaderViewState state;
-  int page = 0;
-  float target_scale = 1.0f;
-  int rotation = 0;
-  int display_w = 0;
-  int display_h = 0;
-  int src_w = 0;
-  int src_h = 0;
-  std::vector<unsigned char> rgba;
-  uint64_t serial = 0;
-};
-
-struct ReaderTexturePoolEntry {
-  SDL_Texture *texture = nullptr;
-  int w = 0;
-  int h = 0;
-  bool in_use = false;
-  uint32_t last_use = 0;
-};
-
-struct TxtReaderState {
-  bool open = false;
-  std::vector<std::string> lines;
-  int scroll_px = 0;
-  int target_scroll_px = 0;
-  int viewport_x = Layout().txt_margin_x;
-  int viewport_y = Layout().txt_margin_y;
-  int viewport_w = Layout().screen_w - Layout().txt_margin_x * 2;
-  int viewport_h = Layout().screen_h - Layout().txt_margin_y * 2;
-  int line_h = 28;
-  int content_h = 0;
-  std::string pending_raw;
-  std::string pending_line;
-  std::string cache_key;
-  size_t parse_pos = 0;
-  bool loading = false;
-  bool truncated = false;
-  bool limit_hit = false;
-  bool truncation_notice_added = false;
-  uint32_t last_resume_cache_save = 0;
-  bool resume_cache_dirty = false;
-};
-
-struct TxtLayoutCacheEntry {
-  std::vector<std::string> lines;
-  int viewport_w = 0;
-  int viewport_h = 0;
-  int line_h = 0;
-  int content_h = 0;
-  bool truncated = false;
-  bool limit_hit = false;
-  uint32_t last_use = 0;
-};
-
-struct TxtResumeCacheEntry {
-  std::vector<std::string> lines;
-  std::string pending_raw;
-  std::string pending_line;
-  int viewport_w = 0;
-  int viewport_h = 0;
-  int line_h = 0;
-  int content_h = 0;
-  int scroll_px = 0;
-  int target_scroll_px = 0;
-  size_t parse_pos = 0;
-  bool loading = false;
-  bool truncated = false;
-  bool limit_hit = false;
-  bool truncation_notice_added = false;
-};
-
-struct TxtTranscodeJob {
-  bool active = false;
-  std::vector<std::string> files;
-  size_t total = 0;
-  size_t processed = 0;
-  size_t converted = 0;
-  size_t failed = 0;
-  std::string current_file;
-};
-
 struct CoverCacheEntry {
   SDL_Texture *texture = nullptr;
   int w = 0;
@@ -946,458 +722,6 @@ SDL_Texture *CreateTextureFromSurface(SDL_Renderer *renderer, SDL_Surface *surfa
   if (!renderer || !surface) return nullptr;
   return SDL_CreateTextureFromSurface(renderer, surface);
 }
-
-class InputManager {
-public:
-  InputManager(const std::string &mapping_path, bool h700_defaults) {
-    pad_map_.fill(InvalidButton());
-    joy_map_.fill(InvalidButton());
-    LoadDefaultPadMap();
-    LoadDefaultJoyMap(h700_defaults);
-    LoadOverrides(mapping_path);
-  }
-
-  void BeginFrame(float dt) {
-    dt_ = dt;
-    for (auto &s : states_) {
-      s.just_pressed = false;
-      s.just_released = false;
-      s.repeated = false;
-      s.long_pressed = false;
-    }
-  }
-
-  void HandleEvent(const SDL_Event &e) {
-    if (e.type == SDL_KEYDOWN && !e.key.repeat) {
-      const Button mapped = KeyToButton(e.key.keysym.sym);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " sym=" << SDL_GetKeyName(e.key.keysym.sym)
-                << " keycode=" << static_cast<int>(e.key.keysym.sym)
-                << " mapped=" << ButtonName(mapped) << "\n";
-      if (mapped == Button::VolUp || mapped == Button::VolDown) {
-        std::cout << "[native_h700] volume event: keydown sym=" << SDL_GetKeyName(e.key.keysym.sym)
-                  << " mapped=" << ButtonName(mapped) << "\n";
-      }
-      SetDown(mapped, true);
-    } else if (e.type == SDL_KEYUP) {
-      const Button mapped = KeyToButton(e.key.keysym.sym);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " sym=" << SDL_GetKeyName(e.key.keysym.sym)
-                << " keycode=" << static_cast<int>(e.key.keysym.sym)
-                << " mapped=" << ButtonName(mapped) << "\n";
-      if (mapped == Button::VolUp || mapped == Button::VolDown) {
-        std::cout << "[native_h700] volume event: keyup sym=" << SDL_GetKeyName(e.key.keysym.sym)
-                  << " mapped=" << ButtonName(mapped) << "\n";
-      }
-      SetDown(mapped, false);
-    } else if (e.type == SDL_CONTROLLERBUTTONDOWN) {
-      const Button mapped = PadToButton(e.cbutton.button);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " button=" << static_cast<int>(e.cbutton.button)
-                << " mapped=" << ButtonName(mapped) << "\n";
-      if (mapped == Button::VolUp || mapped == Button::VolDown) {
-        std::cout << "[native_h700] volume event: pad down button=" << static_cast<int>(e.cbutton.button)
-                  << " mapped=" << ButtonName(mapped) << "\n";
-      }
-      SetDown(mapped, true);
-    } else if (e.type == SDL_CONTROLLERBUTTONUP) {
-      const Button mapped = PadToButton(e.cbutton.button);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " button=" << static_cast<int>(e.cbutton.button)
-                << " mapped=" << ButtonName(mapped) << "\n";
-      if (mapped == Button::VolUp || mapped == Button::VolDown) {
-        std::cout << "[native_h700] volume event: pad up button=" << static_cast<int>(e.cbutton.button)
-                  << " mapped=" << ButtonName(mapped) << "\n";
-      }
-      SetDown(mapped, false);
-    } else if (e.type == SDL_CONTROLLERAXISMOTION) {
-      // Mirror both analog sticks to D-pad semantics for navigation parity.
-      constexpr int kDeadzone = 16000;
-      const int axis = e.caxis.axis;
-      const int val = static_cast<int>(e.caxis.value);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " axis=" << axis
-                << " value=" << val << "\n";
-      if (axis == SDL_CONTROLLER_AXIS_LEFTX || axis == SDL_CONTROLLER_AXIS_RIGHTX) {
-        SetDown(Button::Left, val < -kDeadzone);
-        SetDown(Button::Right, val > kDeadzone);
-      } else if (axis == SDL_CONTROLLER_AXIS_LEFTY || axis == SDL_CONTROLLER_AXIS_RIGHTY) {
-        SetDown(Button::Up, val < -kDeadzone);
-        SetDown(Button::Down, val > kDeadzone);
-      }
-    } else if (e.type == SDL_JOYBUTTONDOWN) {
-      const Button mapped = JoyButtonToButton(e.jbutton.button);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " button=" << static_cast<int>(e.jbutton.button)
-                << " mapped=" << ButtonName(mapped) << "\n";
-      if (mapped == Button::VolUp || mapped == Button::VolDown) {
-        std::cout << "[native_h700] volume event: joy down button=" << static_cast<int>(e.jbutton.button)
-                  << " mapped=" << ButtonName(mapped) << "\n";
-      }
-      SetDown(mapped, true);
-    } else if (e.type == SDL_JOYBUTTONUP) {
-      const Button mapped = JoyButtonToButton(e.jbutton.button);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " button=" << static_cast<int>(e.jbutton.button)
-                << " mapped=" << ButtonName(mapped) << "\n";
-      if (mapped == Button::VolUp || mapped == Button::VolDown) {
-        std::cout << "[native_h700] volume event: joy up button=" << static_cast<int>(e.jbutton.button)
-                  << " mapped=" << ButtonName(mapped) << "\n";
-      }
-      SetDown(mapped, false);
-    } else if (e.type == SDL_JOYHATMOTION) {
-      const uint8_t v = e.jhat.value;
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " hat=" << static_cast<int>(e.jhat.hat)
-                << " value=" << static_cast<int>(v) << "\n";
-      SetDown(Button::Up, (v & SDL_HAT_UP) != 0);
-      SetDown(Button::Down, (v & SDL_HAT_DOWN) != 0);
-      SetDown(Button::Left, (v & SDL_HAT_LEFT) != 0);
-      SetDown(Button::Right, (v & SDL_HAT_RIGHT) != 0);
-    } else if (e.type == SDL_JOYAXISMOTION) {
-      // Some firmwares report D-pad as joystick axes instead of hat/button events.
-      constexpr int kDeadzone = 16000;
-      const int axis = e.jaxis.axis;
-      const int val = static_cast<int>(e.jaxis.value);
-      std::cout << "[native_h700] raw input: type=" << SdlEventName(e.type)
-                << " axis=" << axis
-                << " value=" << val << "\n";
-      if (axis == 0 || axis == 6) {
-        SetDown(Button::Left, val < -kDeadzone);
-        SetDown(Button::Right, val > kDeadzone);
-      } else if (axis == 1 || axis == 7) {
-        SetDown(Button::Up, val < -kDeadzone);
-        SetDown(Button::Down, val > kDeadzone);
-      }
-    }
-  }
-
-  void EndFrame() {
-    for (auto &s : states_) {
-      if (!s.down) {
-        s.hold_time = 0.0f;
-        s.repeat_timer = 0.0f;
-        s.repeat_active = false;
-        continue;
-      }
-
-      s.hold_time += dt_;
-      if (s.hold_time >= 0.8f) s.long_pressed = true;
-
-      if (!s.repeat_active) {
-        s.repeat_active = true;
-        s.repeat_timer = 0.4f;
-        s.repeated = true;
-      } else {
-        s.repeat_timer -= dt_;
-        if (s.repeat_timer <= 0.0f) {
-          s.repeated = true;
-          s.repeat_timer = 0.1f;
-        }
-      }
-    }
-  }
-
-  bool IsPressed(Button b) const { return Get(b).down; }
-  bool IsJustPressed(Button b) const { return Get(b).just_pressed; }
-  bool IsJustReleased(Button b) const { return Get(b).just_released; }
-  bool IsRepeated(Button b) const { return Get(b).repeated; }
-  bool IsLongPressed(Button b) const { return Get(b).long_pressed; }
-  float HoldTime(Button b) const { return Get(b).hold_time; }
-  bool AnyPressed() const {
-    for (const auto &s : states_) {
-      if (s.down) return true;
-    }
-    return false;
-  }
-
-private:
-  static Button InvalidButton() { return static_cast<Button>(-1); }
-
-  static bool IsValid(Button b) {
-    const int i = static_cast<int>(b);
-    return i >= 0 && i < kButtonCount;
-  }
-
-  static Button KeyToButton(SDL_Keycode k) {
-    constexpr SDL_Keycode kVolumeUpFallback = static_cast<SDL_Keycode>(1073741952);
-    constexpr SDL_Keycode kVolumeDownFallback = static_cast<SDL_Keycode>(1073741953);
-    switch (k) {
-    case SDLK_UP: return Button::Up;
-    case SDLK_DOWN: return Button::Down;
-    case SDLK_LEFT: return Button::Left;
-    case SDLK_RIGHT: return Button::Right;
-    case SDLK_a: return Button::A;
-    case SDLK_b: return Button::B;
-    case SDLK_x: return Button::X;
-    case SDLK_y: return Button::Y;
-    case SDLK_m: return Button::Menu;
-    case SDLK_ESCAPE: return Button::B;
-    case SDLK_RETURN: return Button::A;
-    case SDLK_BACKSPACE: return Button::Select;
-    case SDLK_TAB: return Button::Start;
-    case SDLK_q: return Button::L1;
-    case SDLK_w: return Button::R1;
-    case SDLK_e: return Button::L2;
-    case SDLK_r: return Button::R2;
-    case SDLK_1: return Button::L1;
-    case SDLK_2: return Button::L2;
-    case SDLK_4: return Button::R1;
-    case SDLK_3: return Button::R2;
-    case SDLK_z: return Button::Start;
-    case SDLK_c: return Button::Select;
-#ifdef SDLK_VOLUMEUP
-    case SDLK_VOLUMEUP: return Button::VolUp;
-#endif
-#ifdef SDLK_VOLUMEDOWN
-    case SDLK_VOLUMEDOWN: return Button::VolDown;
-#endif
-    case kVolumeUpFallback: return Button::VolUp;
-    case kVolumeDownFallback: return Button::VolDown;
-#ifdef SDLK_PLUS
-    case SDLK_PLUS: return Button::VolUp;
-#endif
-#ifdef SDLK_KP_PLUS
-    case SDLK_KP_PLUS: return Button::VolUp;
-#endif
-#ifdef SDLK_MINUS
-    case SDLK_MINUS: return Button::VolDown;
-#endif
-#ifdef SDLK_KP_MINUS
-    case SDLK_KP_MINUS: return Button::VolDown;
-#endif
-    default: return static_cast<Button>(-1);
-    }
-  }
-
-  Button PadToButton(uint8_t b) const {
-    if (b >= pad_map_.size()) return InvalidButton();
-    return pad_map_[b];
-  }
-
-  Button JoyButtonToButton(uint8_t b) const {
-    if (b >= joy_map_.size()) return InvalidButton();
-    return joy_map_[b];
-  }
-
-  void LoadDefaultPadMap() {
-    pad_map_[SDL_CONTROLLER_BUTTON_DPAD_UP] = Button::Up;
-    pad_map_[SDL_CONTROLLER_BUTTON_DPAD_DOWN] = Button::Down;
-    pad_map_[SDL_CONTROLLER_BUTTON_DPAD_LEFT] = Button::Left;
-    pad_map_[SDL_CONTROLLER_BUTTON_DPAD_RIGHT] = Button::Right;
-    pad_map_[SDL_CONTROLLER_BUTTON_A] = Button::A;
-    pad_map_[SDL_CONTROLLER_BUTTON_B] = Button::B;
-    pad_map_[SDL_CONTROLLER_BUTTON_X] = Button::X;
-    pad_map_[SDL_CONTROLLER_BUTTON_Y] = Button::Y;
-    pad_map_[SDL_CONTROLLER_BUTTON_LEFTSHOULDER] = Button::L1;
-    pad_map_[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER] = Button::R1;
-    pad_map_[SDL_CONTROLLER_BUTTON_LEFTSTICK] = Button::L2;
-    pad_map_[SDL_CONTROLLER_BUTTON_RIGHTSTICK] = Button::R2;
-    pad_map_[SDL_CONTROLLER_BUTTON_BACK] = Button::Select;
-    pad_map_[SDL_CONTROLLER_BUTTON_START] = Button::Start;
-  }
-
-  void LoadDefaultJoyMap(bool h700_defaults) {
-    // Common buttons.
-    joy_map_[0] = Button::A;
-    joy_map_[1] = Button::B;
-    joy_map_[4] = Button::L1;
-    joy_map_[5] = Button::R1;
-    if (h700_defaults) {
-      // H700: swap X/Y to match device-reported button indices.
-      joy_map_[2] = Button::Y;
-      joy_map_[3] = Button::X;
-      // H700 target mapping: Select/Start open menu; L2/R2 rotate pages.
-      joy_map_[6] = Button::Select;
-      joy_map_[7] = Button::Start;
-      joy_map_[8] = Button::Menu;
-      joy_map_[9] = Button::Menu;
-      joy_map_[10] = Button::L2;
-      joy_map_[11] = Button::R2;
-      joy_map_[12] = Button::Select;
-      joy_map_[13] = Button::Start;
-      joy_map_[15] = Button::VolDown;
-      joy_map_[16] = Button::VolUp;
-    } else {
-      joy_map_[2] = Button::X;
-      joy_map_[3] = Button::Y;
-      // Windows/dev current behavior.
-      joy_map_[6] = Button::L2;
-      joy_map_[7] = Button::R2;
-      joy_map_[8] = Button::Select;
-      joy_map_[9] = Button::Start;
-      joy_map_[10] = Button::Menu;
-      joy_map_[11] = Button::Menu;
-      joy_map_[12] = Button::Select;
-      joy_map_[13] = Button::Start;
-      joy_map_[15] = Button::VolDown;
-      joy_map_[16] = Button::VolUp;
-    }
-  }
-
-  static std::string Trim(std::string s) {
-    size_t b = 0;
-    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
-    size_t e = s.size();
-    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
-    return s.substr(b, e - b);
-  }
-
-  static bool ParseButtonName(const std::string &raw, Button &out) {
-    std::string n;
-    n.reserve(raw.size());
-    for (char c : raw) {
-      if (c == ' ' || c == '\t' || c == '-') continue;
-      n.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
-    }
-    if (n == "UP") out = Button::Up;
-    else if (n == "DOWN") out = Button::Down;
-    else if (n == "LEFT") out = Button::Left;
-    else if (n == "RIGHT") out = Button::Right;
-    else if (n == "A") out = Button::A;
-    else if (n == "B") out = Button::B;
-    else if (n == "X") out = Button::X;
-    else if (n == "Y") out = Button::Y;
-    else if (n == "MENU") out = Button::Menu;
-    else if (n == "L1") out = Button::L1;
-    else if (n == "L2") out = Button::L2;
-    else if (n == "R1") out = Button::R1;
-    else if (n == "R2") out = Button::R2;
-    else if (n == "START") out = Button::Start;
-    else if (n == "SELECT") out = Button::Select;
-    else if (n == "VOLUP" || n == "VOLUMEUP") out = Button::VolUp;
-    else if (n == "VOLDOWN" || n == "VOLUMEDOWN") out = Button::VolDown;
-    else if (n == "NONE" || n == "DISABLED" || n == "INVALID") out = InvalidButton();
-    else return false;
-    return true;
-  }
-
-  void LoadOverrides(const std::string &mapping_path) {
-    std::ifstream in(mapping_path);
-    if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
-      line = Trim(line);
-      if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-      const size_t eq = line.find('=');
-      if (eq == std::string::npos) continue;
-      const std::string key = Trim(line.substr(0, eq));
-      const std::string val = Trim(line.substr(eq + 1));
-      Button mapped = InvalidButton();
-      if (!ParseButtonName(val, mapped)) continue;
-      if (key.rfind("joy.", 0) == 0) {
-        const int idx = std::atoi(key.substr(4).c_str());
-        if (idx >= 0 && idx < static_cast<int>(joy_map_.size())) joy_map_[idx] = mapped;
-      } else if (key.rfind("pad.", 0) == 0) {
-        const int idx = std::atoi(key.substr(4).c_str());
-        if (idx >= 0 && idx < static_cast<int>(pad_map_.size())) pad_map_[idx] = mapped;
-      }
-    }
-  }
-
-  void SetDown(Button b, bool down) {
-    if (!IsValid(b)) return;
-    BtnState &s = states_[static_cast<int>(b)];
-    if (down && !s.down) {
-      s.down = true;
-      s.just_pressed = true;
-      s.hold_time = 0.0f;
-    } else if (!down && s.down) {
-      s.down = false;
-      s.just_released = true;
-    }
-  }
-
-  const BtnState &Get(Button b) const {
-    static BtnState empty;
-    if (!IsValid(b)) return empty;
-    return states_[static_cast<int>(b)];
-  }
-
-  std::array<BtnState, kButtonCount> states_{};
-  std::array<Button, 32> pad_map_{};
-  std::array<Button, 32> joy_map_{};
-  float dt_ = 1.0f / 60.0f;
-};
-
-class ProgressStore {
-public:
-  explicit ProgressStore(std::string path) : path_(std::move(path)) { Load(); }
-
-  ReaderProgress Get(const std::string &book) const {
-    auto it = map_.find(book);
-    return it == map_.end() ? ReaderProgress{} : it->second;
-  }
-  void Set(const std::string &book, const ReaderProgress &p) {
-    auto it = map_.find(book);
-    if (it != map_.end() &&
-        it->second.page == p.page &&
-        it->second.rotation == p.rotation &&
-        std::abs(it->second.zoom - p.zoom) < 0.0001f &&
-        it->second.scroll_x == p.scroll_x &&
-        it->second.scroll_y == p.scroll_y) {
-      return;
-    }
-    map_[book] = p;
-    MarkDirty();
-  }
-  bool IsDirty() const { return dirty_; }
-  bool ShouldFlush(uint32_t now, uint32_t delay_ms) const {
-    return dirty_ && (last_dirty_tick_ == 0 || now - last_dirty_tick_ >= delay_ms);
-  }
-  void MarkDirty() {
-    dirty_ = true;
-    last_dirty_tick_ = SDL_GetTicks();
-  }
-  void Save() {
-    std::ofstream out(path_, std::ios::trunc);
-    if (!out) return;
-    for (const auto &kv : map_) {
-      out << kv.first << "\t" << kv.second.page << "\t" << kv.second.rotation << "\t" << kv.second.zoom << "\t"
-          << kv.second.scroll_x << "\t" << kv.second.scroll_y << "\n";
-    }
-    dirty_ = false;
-    last_dirty_tick_ = 0;
-  }
-
-private:
-  void Load() {
-    std::ifstream in(path_);
-    if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
-      if (line.empty()) continue;
-      const size_t p = line.find('\t');
-      if (p == std::string::npos) continue;
-      const std::string key = line.substr(0, p);
-      std::vector<std::string> cols;
-      std::string rest = line.substr(p + 1);
-      size_t start = 0;
-      while (true) {
-        size_t t = rest.find('\t', start);
-        if (t == std::string::npos) {
-          cols.push_back(rest.substr(start));
-          break;
-        }
-        cols.push_back(rest.substr(start, t - start));
-        start = t + 1;
-      }
-      if (cols.size() < 5) continue;
-      ReaderProgress rp;
-      rp.page = std::stoi(cols[0]);
-      rp.rotation = std::stoi(cols[1]);
-      rp.zoom = std::stof(cols[2]);
-      rp.scroll_x = std::stoi(cols[3]);
-      rp.scroll_y = std::stoi(cols[4]);
-      map_[key] = rp;
-    }
-  }
-
-  std::string path_;
-  std::unordered_map<std::string, ReaderProgress> map_;
-  bool dirty_ = false;
-  uint32_t last_dirty_tick_ = 0;
-};
 
 class ConfigStore {
 public:
@@ -2354,18 +1678,18 @@ int main(int, char **) {
       SettingId::ExitApp};
   int menu_selected = 0;
   TxtTranscodeJob txt_transcode_job{};
-
-  std::string current_book;
-  ReaderProgress reader{};
-  ReaderMode reader_mode = ReaderMode::None;
-  TxtReaderState txt_reader{};
-  bool reader_progress_overlay_visible = false;
-  float hold_cooldown = 0.0f;
-  std::array<float, kButtonCount> hold_speed{};
-  std::array<bool, kButtonCount> long_fired{};
+  ReaderUiState reader_ui{};
+  std::string &current_book = reader_ui.current_book;
+  ReaderProgress &reader = reader_ui.progress;
+  ReaderMode &reader_mode = reader_ui.mode;
+  TxtReaderState &txt_reader = reader_ui.txt_reader;
+  bool &reader_progress_overlay_visible = reader_ui.progress_overlay_visible;
+  float &hold_cooldown = reader_ui.hold_cooldown;
+  auto &hold_speed = reader_ui.hold_speed;
+  auto &long_fired = reader_ui.long_fired;
   int nav_selected_index = 0; // 0: ALL COMICS, 1: ALL BOOKS, 2: COLLECTIONS, 3: HISTORY
-  bool warned_mock_pdf_backend = false;
-  bool warned_epub_backend = false;
+  bool &warned_mock_pdf_backend = reader_ui.warned_mock_pdf_backend;
+  bool &warned_epub_backend = reader_ui.warned_epub_backend;
 
   auto current_category = [&]() -> ShelfCategory {
     return static_cast<ShelfCategory>(ClampInt(nav_selected_index, 0, 3));
@@ -3246,32 +2570,7 @@ int main(int, char **) {
     write_string(state.pending_raw);
   };
 
-  auto persist_current_txt_resume_snapshot = [&](const std::string &book_path, bool force) {
-    if (book_path.empty()) return;
-    if (reader_mode != ReaderMode::Txt || !txt_reader.open) return;
-    if (!force && !txt_reader.resume_cache_dirty) return;
-    const uint32_t now = SDL_GetTicks();
-    if (!force && txt_reader.last_resume_cache_save != 0 && now - txt_reader.last_resume_cache_save < kTxtResumeSaveDelayMs) return;
-
-    TxtReaderState snapshot = txt_reader;
-    snapshot.scroll_px = txt_reader.scroll_px;
-    snapshot.target_scroll_px = txt_reader.scroll_px;
-    snapshot.resume_cache_dirty = false;
-    snapshot.last_resume_cache_save = now;
-    if (snapshot.cache_key.empty()) {
-      const SDL_Rect bounds{snapshot.viewport_x, snapshot.viewport_y, snapshot.viewport_w, snapshot.viewport_h};
-      std::error_code ec;
-      const uintmax_t file_size = std::filesystem::file_size(std::filesystem::path(book_path), ec);
-      const auto mtime_raw = std::filesystem::last_write_time(std::filesystem::path(book_path), ec);
-      const long long file_mtime = ec ? 0LL : static_cast<long long>(mtime_raw.time_since_epoch().count());
-      snapshot.cache_key =
-          make_txt_layout_cache_key(book_path, bounds, snapshot.line_h, ec ? 0 : file_size, file_mtime);
-    }
-    if (snapshot.cache_key.empty()) return;
-    save_txt_resume_cache_to_disk(snapshot.cache_key, snapshot);
-    txt_reader.last_resume_cache_save = now;
-    txt_reader.resume_cache_dirty = false;
-  };
+  std::function<void(const std::string &, bool)> persist_current_txt_resume_snapshot;
 
   auto prune_text_cache = [&]() {
     while (text_cache.size() > kTextCacheMaxEntries) {
@@ -4076,17 +3375,6 @@ int main(int, char **) {
     return effective_display_size(state.page, state.rotation, target_scale, out_w, out_h);
   };
 
-  auto reader_page_render_mode_for_state = [&](const ReaderViewState &state) -> ReaderPageRenderMode {
-    ReaderPageRenderMode mode;
-    if (!reader_is_open()) return mode;
-    const float target_scale = reader_target_scale_for_state(state);
-    if (!effective_display_size(state.page, state.rotation, target_scale, mode.display_w, mode.display_h)) {
-      mode.display_w = Layout().screen_w;
-      mode.display_h = Layout().screen_h;
-    }
-    return mode;
-  };
-
   auto prune_reader_neighbor_caches = [&](int center_page, int rotation, float target_scale) {
     ReaderRenderCache *neighbors[2] = {&secondary_render_cache, &tertiary_render_cache};
     for (ReaderRenderCache *cache : neighbors) {
@@ -4317,45 +3605,6 @@ int main(int, char **) {
     if (!adaptive_render.pending_page_active) return;
     adaptive_render.pending_page_commit_tick = 0;
     flush_pending_page_flip();
-  };
-
-  auto long_dir_for_button = [&](Button b) -> int {
-    if (target_state.rotation == 0) {
-      if (b == Button::Down) return 1;
-      if (b == Button::Up) return -1;
-    } else if (target_state.rotation == 270) {
-      if (b == Button::Right) return 1;
-      if (b == Button::Left) return -1;
-    } else if (target_state.rotation == 90) {
-      if (b == Button::Left) return 1;
-      if (b == Button::Right) return -1;
-    } else {
-      if (b == Button::Up) return 1;
-      if (b == Button::Down) return -1;
-    }
-    return 0;
-  };
-
-  auto tap_page_action_for_button = [&](Button b) -> int {
-    // Keep page-flip on the non-scroll axis:
-    // rot 0:   Left/Right flip pages
-    // rot 90:  Up/Down flip pages
-    // rot 180: Left/Right flip pages (reversed)
-    // rot 270: Up/Down flip pages (reversed)
-    if (target_state.rotation == 0) {
-      if (b == Button::Right) return 1;
-      if (b == Button::Left) return -1;
-    } else if (target_state.rotation == 90) {
-      if (b == Button::Down) return 1;
-      if (b == Button::Up) return -1;
-    } else if (target_state.rotation == 180) {
-      if (b == Button::Left) return 1;
-      if (b == Button::Right) return -1;
-    } else { // 270
-      if (b == Button::Up) return 1;
-      if (b == Button::Down) return -1;
-    }
-    return 0;
   };
 
   auto scroll_by_dir = [&](int dir, int step_px) {
@@ -4591,86 +3840,39 @@ int main(int, char **) {
 #endif
   };
 
-  auto finalize_text_reader_loading = [&](TxtReaderState &state, const std::string *cache_key = nullptr) {
-    if ((state.truncated || state.limit_hit || state.lines.size() >= kTxtMaxWrappedLines) &&
-        !state.truncation_notice_added) {
-      state.lines.push_back("");
-      state.lines.push_back("[TXT preview truncated]");
-      state.truncation_notice_added = true;
-    }
-    if (state.lines.empty()) state.lines.emplace_back("");
-    state.content_h = static_cast<int>(state.lines.size()) * state.line_h;
-    state.resume_cache_dirty = true;
-    if (cache_key && !cache_key->empty() && !state.loading) {
-      TxtLayoutCacheEntry entry;
-      entry.lines = state.lines;
-      entry.viewport_w = state.viewport_w;
-      entry.viewport_h = state.viewport_h;
-      entry.line_h = state.line_h;
-      entry.content_h = state.content_h;
-      entry.truncated = state.truncated;
-      entry.limit_hit = state.limit_hit;
-      entry.last_use = SDL_GetTicks();
-      txt_layout_cache[*cache_key] = std::move(entry);
-      save_txt_layout_cache_to_disk(*cache_key, txt_layout_cache[*cache_key]);
-      prune_txt_layout_cache();
-    }
+  auto make_txt_session_deps = [&]() {
+    return TxtReaderSessionDeps{
+        reader_ui,
+        txt_layout_cache,
+        open_ui_font,
+        [&]() -> bool { return ui_font_reader != nullptr; },
+        [&]() -> int {
+#ifdef HAVE_SDL2_TTF
+          return ui_font_reader ? TTF_FontHeight(ui_font_reader) : 0;
+#else
+          return 0;
+#endif
+        },
+        get_text_viewport_bounds,
+        make_txt_layout_cache_key,
+        load_txt_layout_cache_from_disk,
+        save_txt_layout_cache_to_disk,
+        load_txt_resume_cache_from_disk,
+        save_txt_resume_cache_to_disk,
+        prune_txt_layout_cache,
+        [&](const std::string &raw, std::string &out) { return DecodeTextBytesToUtf8(raw, out); },
+        append_wrapped_text_line,
+        invalidate_all_render_cache,
+        clamp_text_scroll,
+        kTxtLineSpacing,
+        kTxtMaxBytes,
+        kTxtResumeSaveDelayMs,
+    };
   };
 
-  auto process_text_layout_chunk = [&](TxtReaderState &state, uint32_t budget_ms, size_t byte_budget,
-                                       const std::string *cache_key = nullptr) {
-    if (!state.open || !state.loading) return;
-    const uint32_t started = SDL_GetTicks();
-    size_t consumed = 0;
-    const size_t prev_parse_pos = state.parse_pos;
-    const size_t prev_line_count = state.lines.size();
-    while (state.parse_pos < state.pending_raw.size() && !state.limit_hit) {
-      const char ch = state.pending_raw[state.parse_pos++];
-      ++consumed;
-      if (ch == '\n' || ch == '\r') {
-        if (!append_wrapped_text_line(state, state.pending_line)) {
-          state.limit_hit = true;
-          break;
-        }
-        state.pending_line.clear();
-        if (ch == '\r' && state.parse_pos < state.pending_raw.size() && state.pending_raw[state.parse_pos] == '\n') {
-          ++state.parse_pos;
-          ++consumed;
-        }
-      } else {
-        state.pending_line.push_back(ch);
-      }
-      if (consumed >= byte_budget) break;
-      if (budget_ms > 0 && SDL_GetTicks() - started >= budget_ms) break;
-    }
-    if (!state.limit_hit && state.parse_pos >= state.pending_raw.size()) {
-      if (!append_wrapped_text_line(state, state.pending_line)) {
-        state.limit_hit = true;
-      }
-      state.pending_line.clear();
-    }
-    const int max_scroll = std::max(0, state.content_h - state.viewport_h);
-    state.scroll_px = ClampInt(state.target_scroll_px, 0, max_scroll);
-    if (state.parse_pos != prev_parse_pos || state.lines.size() != prev_line_count) {
-      state.resume_cache_dirty = true;
-    }
-    if (state.limit_hit || state.parse_pos >= state.pending_raw.size()) {
-      state.loading = false;
-      state.pending_raw.clear();
-      state.pending_line.clear();
-      state.scroll_px = ClampInt(state.target_scroll_px, 0, std::max(0, state.content_h - state.viewport_h));
-      finalize_text_reader_loading(state, cache_key);
-    }
-  };
-
-  auto warm_text_reader_to_target = [&](TxtReaderState &state, const std::string *cache_key = nullptr) {
-    if (!state.loading) return;
-    const int desired_bottom = state.target_scroll_px + state.viewport_h;
-    if (desired_bottom <= state.viewport_h) return;
-    while (state.loading && state.content_h < desired_bottom) {
-      process_text_layout_chunk(state, 0, 262144, cache_key);
-    }
-    state.scroll_px = ClampInt(state.target_scroll_px, 0, std::max(0, state.content_h - state.viewport_h));
+  persist_current_txt_resume_snapshot = [&](const std::string &book_path, bool force) {
+    auto deps = make_txt_session_deps();
+    PersistCurrentTxtResumeSnapshot(book_path, force, deps);
   };
 
   auto open_text_book = [&](const std::string &path) -> bool {
@@ -4679,165 +3881,19 @@ int main(int, char **) {
     std::cerr << "[reader] txt reader requires SDL_ttf build support.\n";
     return false;
 #else
-    open_ui_font();
-    if (!ui_font_reader) {
-      std::cerr << "[reader] txt reader failed: ui font unavailable.\n";
-      return false;
-    }
-    const SDL_Rect text_bounds = get_text_viewport_bounds();
-    int font_h = TTF_FontHeight(ui_font_reader);
-    if (font_h <= 0) font_h = 24;
-    const int line_h = font_h + kTxtLineSpacing;
-    std::error_code meta_ec;
-    const uintmax_t cache_file_size = std::filesystem::file_size(std::filesystem::path(path), meta_ec);
-    const auto cache_mtime_raw = std::filesystem::last_write_time(std::filesystem::path(path), meta_ec);
-    const long long cache_file_mtime = meta_ec ? 0LL : static_cast<long long>(cache_mtime_raw.time_since_epoch().count());
-    const std::string txt_cache_key =
-        make_txt_layout_cache_key(path, text_bounds, line_h, meta_ec ? 0 : cache_file_size, cache_file_mtime);
-
-    TxtReaderState next{};
-    next.open = true;
-    next.viewport_x = text_bounds.x;
-    next.viewport_y = text_bounds.y;
-    next.viewport_w = text_bounds.w;
-    next.viewport_h = text_bounds.h;
-    next.line_h = line_h;
-    next.cache_key = txt_cache_key;
-
-    auto txt_cache_it = txt_layout_cache.find(next.cache_key);
-    if (txt_cache_it != txt_layout_cache.end()) {
-      txt_cache_it->second.last_use = SDL_GetTicks();
-      next.lines = txt_cache_it->second.lines;
-      next.content_h = txt_cache_it->second.content_h;
-      next.truncated = txt_cache_it->second.truncated;
-      next.limit_hit = txt_cache_it->second.limit_hit;
-      next.truncation_notice_added = true;
-      next.loading = false;
-      next.target_scroll_px = std::max(0, reader.scroll_y);
-      next.scroll_px = ClampInt(next.target_scroll_px, 0, std::max(0, next.content_h - next.viewport_h));
-      txt_reader = std::move(next);
-      reader_mode = ReaderMode::Txt;
-      reader_progress_overlay_visible = false;
-      invalidate_all_render_cache();
-      clamp_text_scroll();
-      return true;
-    }
-    TxtLayoutCacheEntry disk_cache_entry;
-    if (load_txt_layout_cache_from_disk(next.cache_key, disk_cache_entry)) {
-      disk_cache_entry.last_use = SDL_GetTicks();
-      txt_layout_cache[next.cache_key] = disk_cache_entry;
-      prune_txt_layout_cache();
-      next.lines = disk_cache_entry.lines;
-      next.content_h = disk_cache_entry.content_h;
-      next.truncated = disk_cache_entry.truncated;
-      next.limit_hit = disk_cache_entry.limit_hit;
-      next.truncation_notice_added = true;
-      next.loading = false;
-      next.target_scroll_px = std::max(0, reader.scroll_y);
-      next.scroll_px = ClampInt(next.target_scroll_px, 0, std::max(0, next.content_h - next.viewport_h));
-      txt_reader = std::move(next);
-      reader_mode = ReaderMode::Txt;
-      reader_progress_overlay_visible = false;
-      invalidate_all_render_cache();
-      clamp_text_scroll();
-      return true;
-    }
-    TxtResumeCacheEntry resume_cache_entry;
-    if (load_txt_resume_cache_from_disk(next.cache_key, resume_cache_entry)) {
-      const int restored_scroll_px = std::max(std::max(0, reader.scroll_y), std::max(0, resume_cache_entry.scroll_px));
-      next.lines = std::move(resume_cache_entry.lines);
-      next.pending_raw = std::move(resume_cache_entry.pending_raw);
-      next.pending_line = std::move(resume_cache_entry.pending_line);
-      next.content_h = resume_cache_entry.content_h;
-      next.parse_pos = resume_cache_entry.parse_pos;
-      next.loading = resume_cache_entry.loading;
-      next.truncated = resume_cache_entry.truncated;
-      next.limit_hit = resume_cache_entry.limit_hit;
-      next.truncation_notice_added = resume_cache_entry.truncation_notice_added;
-      next.target_scroll_px = restored_scroll_px;
-      next.scroll_px = ClampInt(next.target_scroll_px, 0, std::max(0, next.content_h - next.viewport_h));
-      next.last_resume_cache_save = SDL_GetTicks();
-      next.resume_cache_dirty = false;
-      txt_reader = std::move(next);
-      txt_reader.scroll_px = ClampInt(txt_reader.target_scroll_px, 0, std::max(0, txt_reader.content_h - txt_reader.viewport_h));
-      reader_mode = ReaderMode::Txt;
-      reader_progress_overlay_visible = false;
-      invalidate_all_render_cache();
-      clamp_text_scroll();
-      return true;
-    }
-
-    std::ifstream in(std::filesystem::path(path), std::ios::binary);
-    if (!in) {
-      std::cerr << "[reader] txt open failed: " << path << "\n";
-      return false;
-    }
-    std::string raw;
-    try {
-      std::error_code ec;
-      const auto fsz = std::filesystem::file_size(std::filesystem::path(path), ec);
-      if (!ec && fsz > 0) {
-        const size_t cap = static_cast<size_t>(std::min<uintmax_t>(fsz, kTxtMaxBytes));
-        raw.resize(cap);
-        in.read(raw.data(), static_cast<std::streamsize>(cap));
-        raw.resize(static_cast<size_t>(in.gcount()));
-      } else {
-        std::ostringstream oss;
-        oss << in.rdbuf();
-        raw = oss.str();
-        if (raw.size() > kTxtMaxBytes) raw.resize(kTxtMaxBytes);
-      }
-    } catch (...) {
-      std::cerr << "[reader] txt read failed (exception): " << path << "\n";
-      return false;
-    }
-    bool truncated = false;
-    if (raw.size() >= kTxtMaxBytes) {
-      truncated = true;
-    }
-    std::string decoded;
-    if (DecodeTextBytesToUtf8(raw, decoded)) {
-      raw = std::move(decoded);
-    }
-    next.pending_raw = std::move(raw);
-    next.pending_line.reserve(256);
-    next.parse_pos = 0;
-    next.loading = true;
-    next.truncated = truncated;
-    next.limit_hit = false;
-    next.truncation_notice_added = false;
-    next.lines.reserve(1024);
-    next.target_scroll_px = std::max(0, reader.scroll_y);
-    next.scroll_px = 0;
-    next.last_resume_cache_save = 0;
-    next.resume_cache_dirty = true;
-
-    txt_reader = std::move(next);
-    process_text_layout_chunk(txt_reader, 8, 32768, &txt_reader.cache_key);
-    warm_text_reader_to_target(txt_reader, &txt_reader.cache_key);
-    if (!txt_reader.loading) finalize_text_reader_loading(txt_reader, &txt_reader.cache_key);
-    txt_reader.scroll_px = ClampInt(txt_reader.scroll_px, 0, std::max(0, txt_reader.content_h - txt_reader.viewport_h));
-    reader_mode = ReaderMode::Txt;
-    reader_progress_overlay_visible = false;
-    invalidate_all_render_cache();
-    clamp_text_scroll();
-    return true;
+    auto deps = make_txt_session_deps();
+    return OpenTextBookSession(path, deps);
 #endif
   };
 
   auto text_scroll_by = [&](int delta_px) {
-    if (reader_mode != ReaderMode::Txt || !txt_reader.open) return;
-    txt_reader.scroll_px += delta_px;
-    txt_reader.target_scroll_px = txt_reader.scroll_px;
-    clamp_text_scroll();
-    txt_reader.resume_cache_dirty = true;
-    persist_current_txt_resume_snapshot(current_book, false);
+    auto deps = make_txt_session_deps();
+    TextScrollBy(delta_px, current_book, deps);
   };
 
   auto text_page_by = [&](int dir) {
-    if (reader_mode != ReaderMode::Txt || !txt_reader.open) return;
-    const int step = std::max(80, txt_reader.viewport_h - txt_reader.line_h);
-    text_scroll_by(dir * step);
+    auto deps = make_txt_session_deps();
+    TextPageBy(dir, current_book, deps);
   };
 
   auto start_next_boot_count_root = [&]() -> bool {
@@ -4945,7 +4001,8 @@ int main(int, char **) {
     input.EndFrame();
 
     if (reader_mode == ReaderMode::Txt && txt_reader.open && txt_reader.loading) {
-      process_text_layout_chunk(txt_reader, 5, 24576, &txt_reader.cache_key);
+      auto deps = make_txt_session_deps();
+      ProcessTextLayoutChunk(txt_reader, 5, 24576, &txt_reader.cache_key, deps);
       clamp_text_scroll();
       persist_current_txt_resume_snapshot(current_book, false);
     }
@@ -5307,91 +4364,36 @@ int main(int, char **) {
           grid_item_anims.clear();
         } else if (!item.is_dir) {
           history_store.Add(item.path);
-          current_book = item.path;
-          reader = progress.Get(current_book);
-          const std::string ext = GetLowerExt(current_book);
-          std::cout << "[reader] open request: " << current_book << " ext=" << ext << "\n";
-          bool opened = false;
-          if (ext == ".txt") {
-            opened = open_text_book(current_book);
-          } else if (ext == ".pdf") {
-            PdfRuntimeProgress pdf_progress;
-            pdf_progress.page = reader.page;
-            pdf_progress.rotation = reader.rotation;
-            pdf_progress.zoom = reader.zoom;
-            pdf_progress.scroll_y = reader.scroll_y;
-            if (pdf_runtime.Open(renderer, current_book, Layout().screen_w, Layout().screen_h, pdf_progress)) {
-              reader_page_size_cache.clear();
-              adaptive_render = ReaderAdaptiveRenderState{};
-              reset_reader_async_state();
-              close_text_reader();
-              reader_mode = ReaderMode::Pdf;
-              invalidate_all_render_cache();
-              display_state = ReaderViewState{};
-              ready_state = ReaderViewState{};
-              display_state_valid = false;
-              ready_state_valid = false;
-              const PdfRuntimeProgress active_pdf = pdf_runtime.Progress();
-              target_state = ReaderViewState{active_pdf.page, active_pdf.zoom, active_pdf.rotation};
-              clamp_scroll();
-              opened = true;
-            }
-            if (!opened && !pdf_runtime.HasRealRenderer()) {
-              if (!warned_mock_pdf_backend) {
-                std::cerr << "[reader] blocked: current build has no real document backend. "
-                             "Please rebuild with REQUIRE_MUPDF=1 and install MuPDF (preferred) or poppler-cpp.\n";
-                warned_mock_pdf_backend = true;
-              }
-            }
-          } else if (ext == ".epub") {
-            if (epub_comic.Open(current_book)) {
-              reader_page_size_cache.clear();
-              adaptive_render = ReaderAdaptiveRenderState{};
-              reset_reader_async_state();
-              close_text_reader();
-              pdf_runtime.Close();
-              reader_mode = ReaderMode::Epub;
-              epub_comic.SetPage(reader.page);
-              invalidate_all_render_cache();
-              display_state = ReaderViewState{};
-              ready_state = ReaderViewState{};
-              display_state_valid = false;
-              ready_state_valid = false;
-              target_state = ReaderViewState{reader_current_page(), reader.zoom, reader.rotation};
-              clamp_scroll();
-              opened = true;
-            }
-            if (!opened && !epub_comic.HasRealRenderer()) {
-              if (!warned_epub_backend) {
-                std::cerr << "[reader] blocked: current build has no epub comic backend. "
-                             "Please rebuild with libzip (pkg-config libzip) available.\n";
-                warned_epub_backend = true;
-              }
-            }
-          } else {
-            // Keep unsupported formats in shelf for now.
-            std::cerr << "[reader] unsupported format for runtime reader: " << current_book << "\n";
-            opened = false;
-          }
-
+          reader = progress.Get(item.path);
+          const std::string ext = GetLowerExt(item.path);
+          std::cout << "[reader] open request: " << item.path << " ext=" << ext << "\n";
+          ReaderOpenDeps open_deps{
+              renderer,
+              Layout().screen_w,
+              Layout().screen_h,
+              reader_ui,
+              pdf_runtime,
+              epub_comic,
+              adaptive_render,
+              display_state,
+              ready_state,
+              target_state,
+              display_state_valid,
+              ready_state_valid,
+              open_text_book,
+              close_text_reader,
+              reset_reader_async_state,
+              invalidate_all_render_cache,
+              [&]() { reader_page_size_cache.clear(); },
+              clamp_scroll,
+              reader_current_page,
+          };
+          const bool opened = OpenReaderSession(item.path, ext, open_deps);
           if (opened) {
-            reader_progress_overlay_visible = false;
             state = State::Reader;
             scene_flash.Snap(kSceneFadeFlashAlpha);
             scene_flash.AnimateTo(0.0f, kSceneFadeFlashDurationSec, animation::Ease::OutCubic);
-          } else {
-            if (ext == ".pdf" || ext == ".epub") {
-              std::cerr << "[reader] failed to open: " << current_book << "\n";
-            }
-            current_book.clear();
-            close_text_reader();
-            pdf_runtime.Close();
-            epub_comic.Close();
-            reader_page_size_cache.clear();
-            invalidate_all_render_cache();
           }
-          for (auto &v : hold_speed) v = 0.0f;
-          for (auto &v : long_fired) v = false;
         }
       }
       const int new_page = shelf_page;
@@ -5463,41 +4465,23 @@ int main(int, char **) {
     } else if (state == State::Reader) {
       if (input.IsJustPressed(Button::B)) {
         if (reader_mode != ReaderMode::Txt) flush_pending_page_flip_now();
-        if (reader_mode == ReaderMode::Pdf && pdf_runtime.IsOpen()) {
-          const PdfRuntimeProgress active_pdf = pdf_runtime.Progress();
-          reader.page = active_pdf.page;
-          reader.scroll_y = active_pdf.scroll_y;
-          reader.zoom = active_pdf.zoom;
-          reader.rotation = active_pdf.rotation;
-        } else if (reader_mode == ReaderMode::Epub && epub_comic.IsOpen()) {
-          reader.page = epub_comic.CurrentPage();
-        } else if (reader_mode == ReaderMode::Txt && txt_reader.open) {
-          reader.page = (txt_reader.line_h > 0) ? (txt_reader.scroll_px / txt_reader.line_h) : 0;
-          reader.scroll_y = txt_reader.scroll_px;
-          txt_reader.resume_cache_dirty = true;
-          persist_current_txt_resume_snapshot(current_book, true);
-        }
-        ReaderProgress save_reader = reader;
-        progress.Set(current_book, save_reader);
-        if (reader_mode == ReaderMode::Pdf) {
-          pdf_runtime.Close();
-          reader_page_size_cache.clear();
-          reset_reader_async_state();
-        } else if (reader_mode == ReaderMode::Epub) {
-          epub_comic.Close();
-          reader_page_size_cache.clear();
-          reset_reader_async_state();
-        } else if (reader_mode == ReaderMode::Txt) {
-          close_text_reader();
-        }
-        invalidate_all_render_cache();
-        display_state = ReaderViewState{};
-        ready_state = ReaderViewState{};
-        target_state = ReaderViewState{};
-        display_state_valid = false;
-        ready_state_valid = false;
-        reader_mode = ReaderMode::None;
-        reader_progress_overlay_visible = false;
+        ReaderCloseDeps close_deps{
+            reader_ui,
+            progress,
+            pdf_runtime,
+            epub_comic,
+            display_state,
+            ready_state,
+            target_state,
+            display_state_valid,
+            ready_state_valid,
+            close_text_reader,
+            reset_reader_async_state,
+            invalidate_all_render_cache,
+            [&]() { reader_page_size_cache.clear(); },
+            persist_current_txt_resume_snapshot,
+        };
+        CloseReaderSession(close_deps);
         state = State::Shelf;
         scene_flash.Snap(kSceneFadeFlashAlpha);
         scene_flash.AnimateTo(0.0f, kSceneFadeFlashDurationSec, animation::Ease::OutCubic);
@@ -5506,82 +4490,17 @@ int main(int, char **) {
           reader_progress_overlay_visible = !reader_progress_overlay_visible;
         }
         if (reader_mode == ReaderMode::Txt && txt_reader.open) {
-          std::array<Button, 2> vdirs = {Button::Up, Button::Down};
-          for (Button b : vdirs) {
-            int bi = static_cast<int>(b);
-            const int long_dir = (b == Button::Down) ? 1 : -1;
-            if (input.IsPressed(b)) {
-              const float hold = input.HoldTime(b);
-              const float delay = 0.30f;
-              const float speed_min = 120.0f;
-              const float speed_max = 620.0f;
-              const float speed_accel = 860.0f;
-              if (hold >= delay) {
-                long_fired[bi] = true;
-                hold_speed[bi] = (hold_speed[bi] <= 0.0f)
-                                     ? speed_min
-                                     : std::min(speed_max, hold_speed[bi] + speed_accel * dt);
-                const int step_px = std::max(1, static_cast<int>(hold_speed[bi] * dt));
-                text_scroll_by(long_dir * step_px);
-              } else {
-                hold_speed[bi] = 0.0f;
-              }
-            } else {
-              hold_speed[bi] = 0.0f;
-            }
-          }
-          for (Button b : vdirs) {
-            int bi = static_cast<int>(b);
-            if (!input.IsJustReleased(b)) continue;
-            hold_speed[bi] = 0.0f;
-            if (long_fired[bi]) {
-              long_fired[bi] = false;
-              continue;
-            }
-            const int tap_dir = (b == Button::Down) ? 1 : -1;
-            text_scroll_by(tap_dir * kReaderTapStepPx);
-          }
-          if (input.IsJustPressed(Button::Right)) {
-            text_page_by(1);
-          } else if (input.IsJustPressed(Button::Left)) {
-            text_page_by(-1);
-          }
-          reader.page = (txt_reader.line_h > 0) ? (txt_reader.scroll_px / txt_reader.line_h) : 0;
-          reader.scroll_y = txt_reader.scroll_px;
+          TxtReaderInputDeps txt_input_deps{
+              input,
+              reader_ui,
+              dt,
+              kReaderTapStepPx,
+              text_scroll_by,
+              text_page_by,
+          };
+          HandleTxtReaderInput(txt_input_deps);
         } else if (reader_mode == ReaderMode::Pdf) {
           const int pdf_rotation = pdf_runtime.Progress().rotation;
-          auto pdf_long_dir_for_button = [&](Button b) -> int {
-            if (pdf_rotation == 0) {
-              if (b == Button::Down) return 1;
-              if (b == Button::Up) return -1;
-            } else if (pdf_rotation == 90) {
-              if (b == Button::Left) return 1;   // left -> scroll down
-              if (b == Button::Right) return -1; // right -> scroll up
-            } else if (pdf_rotation == 180) {
-              if (b == Button::Up) return 1;
-              if (b == Button::Down) return -1;
-            } else { // 270
-              if (b == Button::Left) return -1;  // left -> scroll up
-              if (b == Button::Right) return 1;  // right -> scroll down
-            }
-            return 0;
-          };
-          auto pdf_tap_page_action_for_button = [&](Button b) -> int {
-            if (pdf_rotation == 0) {
-              if (b == Button::Right) return 1;
-              if (b == Button::Left) return -1;
-            } else if (pdf_rotation == 90) {
-              if (b == Button::Up) return -1;    // up -> previous page
-              if (b == Button::Down) return 1;   // down -> next page
-            } else if (pdf_rotation == 180) {
-              if (b == Button::Left) return 1;   // left -> next page
-              if (b == Button::Right) return -1; // right -> previous page
-            } else { // 270
-              if (b == Button::Up) return 1;     // up -> next page
-              if (b == Button::Down) return -1;  // down -> previous page
-            }
-            return 0;
-          };
           if (input.IsJustPressed(Button::L2)) {
             pdf_runtime.RotateLeft();
           }
@@ -5601,7 +4520,7 @@ int main(int, char **) {
           std::array<Button, 4> dirs = {Button::Up, Button::Down, Button::Left, Button::Right};
           for (Button b : dirs) {
             int bi = static_cast<int>(b);
-            int long_dir = pdf_long_dir_for_button(b);
+            int long_dir = PdfScrollDirForButton(pdf_rotation, b);
             if (long_dir == 0) {
               hold_speed[bi] = 0.0f;
               continue;
@@ -5621,99 +4540,30 @@ int main(int, char **) {
               long_fired[bi] = false;
               continue;
             }
-            const int tap_dir = pdf_long_dir_for_button(b);
+            const int tap_dir = PdfScrollDirForButton(pdf_rotation, b);
             if (tap_dir != 0) {
               pdf_runtime.ScrollByPixels(tap_dir * 60);
             } else {
-              const int page_action = pdf_tap_page_action_for_button(b);
+              const int page_action = PdfTapPageActionForButton(pdf_rotation, b);
               if (page_action != 0) {
                 pdf_runtime.JumpByScreen(page_action);
               }
             }
           }
         } else {
-          if (input.IsJustPressed(Button::L2) || input.IsJustPressed(Button::R2) ||
-              input.IsJustPressed(Button::L1) || input.IsJustPressed(Button::R1) ||
-              input.IsJustPressed(Button::A)) {
-            flush_pending_page_flip_now();
-          }
-          if (input.IsJustPressed(Button::L2)) {
-            ReaderViewState next_view = target_state;
-            next_view.rotation = (next_view.rotation + 270) % 360;
-            commit_target_view(next_view, true, true);
-          }
-          if (input.IsJustPressed(Button::R2)) {
-            ReaderViewState next_view = target_state;
-            next_view.rotation = (next_view.rotation + 90) % 360;
-            commit_target_view(next_view, true, true);
-          }
-          if (input.IsJustPressed(Button::L1)) {
-            ReaderViewState next_view = target_state;
-            next_view.zoom = std::max(0.25f, next_view.zoom / 1.1f);
-            commit_target_view(next_view, false, true);
-          }
-          if (input.IsJustPressed(Button::R1)) {
-            ReaderViewState next_view = target_state;
-            next_view.zoom = std::min(6.0f, next_view.zoom * 1.1f);
-            commit_target_view(next_view, false, true);
-          }
-          if (input.IsJustPressed(Button::A)) {
-            ReaderViewState next_view = target_state;
-            next_view.zoom = 1.0f;
-            commit_target_view(next_view, false, true);
-            reader.scroll_x = reader.scroll_y = 0;
-            clamp_scroll();
-          }
-
-          std::array<Button, 4> dirs = {Button::Up, Button::Down, Button::Left, Button::Right};
-          for (Button b : dirs) {
-            int bi = static_cast<int>(b);
-            int long_dir = long_dir_for_button(b);
-            if (long_dir == 0) {
-              hold_speed[bi] = 0.0f;
-              continue;
-            }
-            if (input.IsPressed(b)) {
-              const float hold = input.HoldTime(b);
-              float delay = (target_state.rotation == 0) ? 0.33f : 0.28f;
-              float speed_min = (target_state.rotation == 0) ? 95.0f : 120.0f;
-              float speed_max = (target_state.rotation == 0) ? 500.0f : 680.0f;
-              float speed_accel = (target_state.rotation == 0) ? 620.0f : 920.0f;
-              if (hold >= delay) {
-                flush_pending_page_flip_now();
-                long_fired[bi] = true;
-                hold_speed[bi] = (hold_speed[bi] <= 0.0f) ? speed_min : std::min(speed_max, hold_speed[bi] + speed_accel * dt);
-                const int step_px = std::max(1, static_cast<int>(hold_speed[bi] * dt));
-                scroll_by_dir(long_dir, step_px);
-              } else {
-                hold_speed[bi] = 0.0f;
-              }
-            } else {
-              hold_speed[bi] = 0.0f;
-            }
-          }
-
-          for (Button b : dirs) {
-            int bi = static_cast<int>(b);
-            if (!input.IsJustReleased(b)) continue;
-            hold_speed[bi] = 0.0f;
-            if (long_fired[bi]) {
-              long_fired[bi] = false;
-              continue;
-            }
-            const int tap_dir = long_dir_for_button(b);
-            if (tap_dir != 0) {
-              flush_pending_page_flip_now();
-              scroll_by_dir(tap_dir, kReaderTapStepPx);
-            } else {
-              const int page_action = tap_page_action_for_button(b);
-              if (page_action > 0) {
-                queue_page_flip(1);
-              } else if (page_action < 0) {
-                queue_page_flip(-1);
-              }
-            }
-          }
+          EpubReaderInputDeps epub_input_deps{
+              input,
+              reader_ui,
+              target_state,
+              dt,
+              kReaderTapStepPx,
+              flush_pending_page_flip_now,
+              commit_target_view,
+              scroll_by_dir,
+              queue_page_flip,
+              clamp_scroll,
+          };
+          HandleEpubReaderInput(epub_input_deps);
         }
       }
     }
@@ -6096,93 +4946,42 @@ int main(int, char **) {
       if (state == State::Reader) {
         DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{12, 12, 12, 255});
         if (reader_mode == ReaderMode::Txt && txt_reader.open) {
-          clamp_text_scroll();
+          TxtReaderRenderDeps txt_render_deps{
+              renderer,
+              reader_ui,
+              clamp_text_scroll,
+              [&](const SDL_Rect &clip) { SDL_RenderSetClipRect(renderer, &clip); },
+              [&]() { SDL_RenderSetClipRect(renderer, nullptr); },
+              [&](const std::string &text, int x, int y) {
 #ifdef HAVE_SDL2_TTF
-          const SDL_Rect clip{txt_reader.viewport_x, txt_reader.viewport_y, txt_reader.viewport_w, txt_reader.viewport_h};
-          SDL_RenderSetClipRect(renderer, &clip);
-          const SDL_Color color{242, 244, 248, 255};
-          const int text_x = txt_reader.viewport_x + 2;
-          const int start_line = std::max(0, txt_reader.scroll_px / std::max(1, txt_reader.line_h));
-          int y = txt_reader.viewport_y - (txt_reader.scroll_px % std::max(1, txt_reader.line_h));
-          for (int i = start_line; i < static_cast<int>(txt_reader.lines.size()); ++i) {
-            if (y > txt_reader.viewport_y + txt_reader.viewport_h) break;
-            TextCacheEntry *te = get_reader_text_texture(txt_reader.lines[i], color);
-            if (te && te->texture) {
-              SDL_Rect td{text_x, y, te->w, te->h};
-              SDL_RenderCopy(renderer, te->texture, nullptr, &td);
-            }
-            y += txt_reader.line_h;
-          }
-          SDL_RenderSetClipRect(renderer, nullptr);
+                const SDL_Color color{242, 244, 248, 255};
+                TextCacheEntry *te = get_reader_text_texture(text, color);
+                if (te && te->texture) {
+                  SDL_Rect td{x, y, te->w, te->h};
+                  SDL_RenderCopy(renderer, te->texture, nullptr, &td);
+                }
+#else
+                (void)text;
+                (void)x;
+                (void)y;
 #endif
+              },
+          };
+          DrawTxtReaderRuntime(txt_render_deps);
         } else if (reader_mode == ReaderMode::Pdf && pdf_runtime.IsOpen()) {
           pdf_runtime.UpdateViewport(Layout().screen_w, Layout().screen_h);
           pdf_runtime.Tick();
           pdf_runtime.Draw(renderer);
         } else {
           clamp_scroll();
-          ensure_render();
-          const ReaderViewState draw_state =
-              display_state_valid ? display_state : target_state;
-          const ReaderPageRenderMode draw_mode = reader_page_render_mode_for_state(draw_state);
-          const float draw_scale =
-              (display_state_valid && render_cache.texture
-                   ? render_cache.scale
-                   : reader_target_scale_for_state(draw_state));
-          const bool showing_placeholder = (!display_state_valid || display_state != target_state);
-          bool drew_reader_content = false;
-          if (const ReaderRenderCache *cache =
-                  visible_reader_render_cache_for_page(draw_state.page, draw_state.rotation, draw_scale)) {
-            const bool cache_matches_display =
-                cache->page == draw_state.page &&
-                cache->rotation == draw_state.rotation &&
-                std::abs(cache->scale - draw_scale) < 0.0005f;
-            int draw_x =
-                (cache->display_w <= Layout().screen_w)
-                    ? ((Layout().screen_w - cache->display_w) / 2)
-                    : (!showing_placeholder && cache_matches_display ? -reader.scroll_x : 0);
-            int draw_y =
-                (cache->display_h <= Layout().screen_h)
-                    ? ((Layout().screen_h - cache->display_h) / 2)
-                    : (!showing_placeholder && cache_matches_display ? -reader.scroll_y : 0);
-            SDL_Rect dst{draw_x, draw_y, cache->display_w, cache->display_h};
-            SDL_RenderCopy(renderer, cache->texture, nullptr, &dst);
-            drew_reader_content = true;
-#ifdef HAVE_SDL2_TTF
-            if (showing_placeholder || !cache_matches_display) {
-              DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{0, 0, 0, 96});
-              if (!adaptive_render.pending_page_active) {
-                const int panel_w = std::min(Layout().screen_w - 40, 280);
-                const int panel_h = 64;
-                const int panel_x = (Layout().screen_w - panel_w) / 2;
-                const int panel_y = (Layout().screen_h - panel_h) / 2;
-                DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{16, 16, 18, 200});
-                DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{255, 255, 255, 40}, false);
-                SDL_Color text_color{244, 246, 250, 255};
-                if (TextCacheEntry *te = get_text_texture("Rendering...", text_color); te && te->texture) {
-                  SDL_Rect td{
-                      panel_x + std::max(0, (panel_w - te->w) / 2),
-                      panel_y + std::max(0, (panel_h - te->h) / 2),
-                      te->w,
-                      te->h,
-                  };
-                  SDL_RenderCopy(renderer, te->texture, nullptr, &td);
-                }
-              }
-            }
-#endif
-          }
-#ifdef HAVE_SDL2_TTF
-          if (!drew_reader_content && !adaptive_render.pending_page_active) {
-            DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{0, 0, 0, 96});
-            const int panel_w = std::min(Layout().screen_w - 40, 280);
-            const int panel_h = 64;
+          auto draw_centered_reader_label = [&](const std::string &text, int panel_w, int panel_h, SDL_Color panel_color, SDL_Color border_color) {
             const int panel_x = (Layout().screen_w - panel_w) / 2;
             const int panel_y = (Layout().screen_h - panel_h) / 2;
-            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{16, 16, 18, 200});
-            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{255, 255, 255, 40}, false);
+            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, panel_color);
+            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, border_color, false);
+#ifdef HAVE_SDL2_TTF
             SDL_Color text_color{244, 246, 250, 255};
-            if (TextCacheEntry *te = get_text_texture("Rendering...", text_color); te && te->texture) {
+            if (TextCacheEntry *te = get_text_texture(text, text_color); te && te->texture) {
               SDL_Rect td{
                   panel_x + std::max(0, (panel_w - te->w) / 2),
                   panel_y + std::max(0, (panel_h - te->h) / 2),
@@ -6191,32 +4990,34 @@ int main(int, char **) {
               };
               SDL_RenderCopy(renderer, te->texture, nullptr, &td);
             }
-          }
+#else
+            (void)text;
 #endif
-#ifdef HAVE_SDL2_TTF
-          if (adaptive_render.pending_page_active && adaptive_render.fast_flip_mode) {
-            DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{0, 0, 0, 120});
-            const int panel_w = std::min(Layout().screen_w - 40, 320);
-            const int panel_h = 76;
-            const int panel_x = (Layout().screen_w - panel_w) / 2;
-            const int panel_y = (Layout().screen_h - panel_h) / 2;
-            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{16, 16, 18, 220});
-            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{255, 255, 255, 48}, false);
-            const int pending_page = ClampInt(adaptive_render.pending_page, 0, std::max(0, reader_page_count() - 1));
-            const std::string fast_flip_text =
-                "Quick Jump: " + std::to_string(pending_page + 1) + " / " + std::to_string(std::max(1, reader_page_count()));
-            SDL_Color text_color{244, 246, 250, 255};
-            if (TextCacheEntry *te = get_text_texture(fast_flip_text, text_color); te && te->texture) {
-              SDL_Rect td{
-                  panel_x + std::max(0, (panel_w - te->w) / 2),
-                  panel_y + std::max(0, (panel_h - te->h) / 2),
-                  te->w,
-                  te->h,
-              };
-              SDL_RenderCopy(renderer, te->texture, nullptr, &td);
-            }
-          }
-#endif
+          };
+          EpubRuntimeRenderDeps epub_render_deps{
+              renderer,
+              Layout().screen_w,
+              Layout().screen_h,
+              reader_ui,
+              adaptive_render,
+              render_cache,
+              display_state,
+              target_state,
+              display_state_valid,
+              ensure_render,
+              reader_target_scale_for_state,
+              visible_reader_render_cache_for_page,
+              reader_page_count,
+              [&](const std::string &text) {
+                draw_centered_reader_label(text, std::min(Layout().screen_w - 40, 280), 64,
+                                           SDL_Color{16, 16, 18, 200}, SDL_Color{255, 255, 255, 40});
+              },
+              [&](const std::string &text) {
+                draw_centered_reader_label(text, std::min(Layout().screen_w - 40, 320), 76,
+                                           SDL_Color{16, 16, 18, 220}, SDL_Color{255, 255, 255, 48});
+              },
+          };
+          DrawEpubRuntime(epub_render_deps);
         }
 #ifdef HAVE_SDL2_TTF
         if (reader_progress_overlay_visible) {

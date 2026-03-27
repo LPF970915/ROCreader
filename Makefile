@@ -4,7 +4,7 @@ REQUIRE_MUPDF ?= 0
 H700_OPTIMIZE ?= 0
 
 TARGET := build/rocreader_sdl
-SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/pdf_runtime.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/animation.cpp
+SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/pdf_runtime.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/animation.cpp src/input_manager.cpp src/reader_core.cpp src/progress_store.cpp src/reader_session_ops.cpp src/txt_reader_runtime.cpp src/txt_reader_session.cpp src/epub_runtime.cpp
 OBJS := $(SRCS:.cpp=.o)
 
 SDL_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
