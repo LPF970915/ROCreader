@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+constexpr int kReaderTexturePoolSize = 6;
+
 struct ReaderProgress {
   int page = 0;
   int rotation = 0;

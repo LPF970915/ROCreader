@@ -12,6 +12,10 @@
 
 namespace {
 constexpr size_t kTxtInitialLineReserve = 1024;
+
+int ClampIntLocal(int value, int lo, int hi) {
+  return std::max(lo, std::min(hi, value));
+}
 }
 
 void FinalizeTextReaderLoading(TxtReaderState &state, const std::string *cache_key, TxtReaderSessionDeps &deps) {
@@ -93,6 +97,14 @@ void WarmTextReaderToTarget(TxtReaderState &state, const std::string *cache_key,
     ProcessTextLayoutChunk(state, 0, 262144, cache_key, deps);
   }
   state.scroll_px = std::clamp(state.target_scroll_px, 0, std::max(0, state.content_h - state.viewport_h));
+}
+
+void TickTextBookSession(const std::string &book_path, TxtReaderSessionDeps &deps,
+                         uint32_t budget_ms, size_t byte_budget) {
+  if (deps.ui.mode != ReaderMode::Txt || !deps.ui.txt_reader.open || !deps.ui.txt_reader.loading) return;
+  ProcessTextLayoutChunk(deps.ui.txt_reader, budget_ms, byte_budget, &deps.ui.txt_reader.cache_key, deps);
+  deps.clamp_text_scroll();
+  PersistCurrentTxtResumeSnapshot(book_path, false, deps);
 }
 
 bool OpenTextBookSession(const std::string &path, TxtReaderSessionDeps &deps) {
@@ -289,4 +301,10 @@ void TextPageBy(int dir, const std::string &book_path, TxtReaderSessionDeps &dep
   if (deps.ui.mode != ReaderMode::Txt || !deps.ui.txt_reader.open) return;
   const int step = std::max(80, deps.ui.txt_reader.viewport_h - deps.ui.txt_reader.line_h);
   TextScrollBy(dir * step, book_path, deps);
+}
+
+int TxtReaderProgressPercent(const TxtReaderState &state) {
+  const int max_scroll = std::max(0, state.content_h - state.viewport_h);
+  if (max_scroll <= 0) return 100;
+  return ClampIntLocal(static_cast<int>((static_cast<int64_t>(state.scroll_px) * 100) / max_scroll), 0, 100);
 }

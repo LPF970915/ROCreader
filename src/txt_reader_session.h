@@ -36,6 +36,9 @@ void FinalizeTextReaderLoading(TxtReaderState &state, const std::string *cache_k
 void ProcessTextLayoutChunk(TxtReaderState &state, uint32_t budget_ms, size_t byte_budget,
                             const std::string *cache_key, TxtReaderSessionDeps &deps);
 void WarmTextReaderToTarget(TxtReaderState &state, const std::string *cache_key, TxtReaderSessionDeps &deps);
+void TickTextBookSession(const std::string &book_path, TxtReaderSessionDeps &deps,
+                         uint32_t budget_ms, size_t byte_budget);
 void PersistCurrentTxtResumeSnapshot(const std::string &book_path, bool force, TxtReaderSessionDeps &deps);
 void TextScrollBy(int delta_px, const std::string &book_path, TxtReaderSessionDeps &deps);
 void TextPageBy(int dir, const std::string &book_path, TxtReaderSessionDeps &deps);
+int TxtReaderProgressPercent(const TxtReaderState &state);

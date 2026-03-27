@@ -4,7 +4,7 @@ REQUIRE_MUPDF ?= 0
 H700_OPTIMIZE ?= 0
 
 TARGET := build/rocreader_sdl
-SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/pdf_runtime.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/animation.cpp src/input_manager.cpp src/reader_core.cpp src/progress_store.cpp src/reader_session_ops.cpp src/txt_reader_runtime.cpp src/txt_reader_session.cpp src/epub_runtime.cpp
+SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/pdf_runtime.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/cover_service.cpp src/boot_runtime.cpp src/app_runtime.cpp src/audio_runtime.cpp src/sdl_utils.cpp src/animation.cpp src/input_manager.cpp src/reader_core.cpp src/reader_runtime_common.cpp src/reader_render_controller.cpp src/reader_render_runtime.cpp src/progress_store.cpp src/reader_session_ops.cpp src/txt_reader_runtime.cpp src/txt_reader_session.cpp src/txt_text_service.cpp src/epub_runtime.cpp src/epub_cover_cache.cpp src/ui_assets.cpp src/ui_assets_loader.cpp src/ui_text_cache.cpp src/shelf_runtime.cpp src/settings_runtime.cpp src/app_stores.cpp
 OBJS := $(SRCS:.cpp=.o)
 
 SDL_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
