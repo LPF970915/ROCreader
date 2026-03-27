@@ -189,10 +189,12 @@ bool PdfReader::PageSize(int page_index, int &w, int &h) const {
 
 bool PdfReader::CurrentPageSize(int &w, int &h) const { return PageSize(CurrentPage(), w, h); }
 
-bool PdfReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h) {
+bool PdfReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h,
+                               const std::atomic<bool> *cancel) {
   if (!IsOpen()) return false;
   page_index = std::clamp(page_index, 0, PageCount() - 1);
   scale = std::max(0.1f, scale);
+  if (cancel && cancel->load()) return false;
 
 #if defined(HAVE_MUPDF)
   fz_pixmap *pix = nullptr;
@@ -219,6 +221,7 @@ bool PdfReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned
     const unsigned char *samples = fz_pixmap_samples(impl_->ctx, pix);
     rgba.assign(static_cast<size_t>(w * h * 4), 255);
     for (int y = 0; y < h; ++y) {
+      if (cancel && cancel->load()) return false;
       const unsigned char *row = samples + y * stride;
       for (int x = 0; x < w; ++x) {
         const int si = x * 3;
@@ -246,6 +249,7 @@ bool PdfReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned
   renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
   renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
   const double dpi = 72.0 * static_cast<double>(scale);
+  if (cancel && cancel->load()) return false;
   poppler::image img = renderer.render_page(page.get(), dpi, dpi);
   if (!img.is_valid()) return false;
 
@@ -258,6 +262,7 @@ bool PdfReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned
   const int stride = img.bytes_per_row();
   const poppler::image::format_enum fmt = img.format();
   for (int y = 0; y < h; ++y) {
+    if (cancel && cancel->load()) return false;
     const unsigned char *row = src + y * stride;
     for (int x = 0; x < w; ++x) {
       const int di = (y * w + x) * 4;
@@ -307,6 +312,153 @@ bool PdfReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned
 #endif
 }
 
-bool PdfReader::RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h) {
-  return RenderPageRGBA(CurrentPage(), scale, rgba, w, h);
+bool PdfReader::RenderPageRegionRGBA(int page_index, float scale, int src_x, int src_y, int src_w, int src_h,
+                                     std::vector<unsigned char> &rgba, int &w, int &h,
+                                     const std::atomic<bool> *cancel) {
+  if (!IsOpen()) return false;
+  page_index = std::clamp(page_index, 0, PageCount() - 1);
+  scale = std::max(0.1f, scale);
+  src_x = std::max(0, src_x);
+  src_y = std::max(0, src_y);
+  src_w = std::max(1, src_w);
+  src_h = std::max(1, src_h);
+  if (cancel && cancel->load()) return false;
+
+#if defined(HAVE_POPPLER)
+  std::unique_ptr<poppler::page> page(impl_->doc->create_page(page_index));
+  if (!page) return false;
+  poppler::page_renderer renderer;
+  renderer.set_render_hint(poppler::page_renderer::text_antialiasing, true);
+  renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
+  const double dpi = 72.0 * static_cast<double>(scale);
+  if (cancel && cancel->load()) return false;
+  // The strip scheduler computes crop rectangles in scaled output pixels. poppler-cpp expects
+  // the crop rectangle in the page's original coordinate space, so convert it back first.
+  const double inv_scale = 1.0 / static_cast<double>(scale);
+  const int crop_x = std::max(0, static_cast<int>(std::floor(static_cast<double>(src_x) * inv_scale)));
+  const int crop_y = std::max(0, static_cast<int>(std::floor(static_cast<double>(src_y) * inv_scale)));
+  const int crop_w = std::max(1, static_cast<int>(std::ceil(static_cast<double>(src_w) * inv_scale)));
+  const int crop_h = std::max(1, static_cast<int>(std::ceil(static_cast<double>(src_h) * inv_scale)));
+  poppler::image img = renderer.render_page(page.get(), dpi, dpi, crop_x, crop_y, crop_w, crop_h);
+  if (!img.is_valid()) return false;
+
+  w = img.width();
+  h = img.height();
+  if (w <= 0 || h <= 0) return false;
+  rgba.assign(static_cast<size_t>(w * h * 4), 255);
+
+  const unsigned char *src = reinterpret_cast<const unsigned char *>(img.data());
+  const int stride = img.bytes_per_row();
+  const poppler::image::format_enum fmt = img.format();
+  for (int y = 0; y < h; ++y) {
+    if (cancel && cancel->load()) return false;
+    const unsigned char *row = src + y * stride;
+    for (int x = 0; x < w; ++x) {
+      const int di = (y * w + x) * 4;
+      if (fmt == poppler::image::format_argb32) {
+        const int si = x * 4;
+        rgba[di + 0] = row[si + 2];
+        rgba[di + 1] = row[si + 1];
+        rgba[di + 2] = row[si + 0];
+        rgba[di + 3] = row[si + 3];
+      } else if (fmt == poppler::image::format_rgb24) {
+        const int si = x * 3;
+        rgba[di + 0] = row[si + 0];
+        rgba[di + 1] = row[si + 1];
+        rgba[di + 2] = row[si + 2];
+        rgba[di + 3] = 255;
+      } else {
+        const int si = x * 4;
+        rgba[di + 0] = row[si + 0];
+        rgba[di + 1] = row[si + 1];
+        rgba[di + 2] = row[si + 2];
+        rgba[di + 3] = 255;
+      }
+    }
+  }
+  return true;
+#elif defined(HAVE_MUPDF)
+  fz_pixmap *pix = nullptr;
+  fz_device *dev = nullptr;
+  fz_page *page = nullptr;
+  fz_rect bounds{};
+  fz_irect page_bounds{};
+  fz_irect crop_bounds{};
+  fz_matrix m = fz_scale(scale, scale);
+
+  fz_try(impl_->ctx) {
+    page = fz_load_page(impl_->ctx, impl_->doc, page_index);
+    bounds = fz_bound_page(impl_->ctx, page);
+    bounds = fz_transform_rect(bounds, m);
+    page_bounds = fz_round_rect(bounds);
+
+    crop_bounds.x0 = src_x;
+    crop_bounds.y0 = src_y;
+    crop_bounds.x1 = src_x + src_w;
+    crop_bounds.y1 = src_y + src_h;
+    crop_bounds = fz_intersect_irect(crop_bounds, page_bounds);
+    if (crop_bounds.x1 <= crop_bounds.x0 || crop_bounds.y1 <= crop_bounds.y0) {
+      fz_throw(impl_->ctx, FZ_ERROR_ARGUMENT, "invalid crop bounds");
+    }
+
+    pix = fz_new_pixmap_with_bbox(impl_->ctx, fz_device_rgb(impl_->ctx), crop_bounds, nullptr, 0);
+    fz_clear_pixmap_with_value(impl_->ctx, pix, 255);
+    dev = fz_new_draw_device(impl_->ctx, m, pix);
+    fz_run_page(impl_->ctx, page, dev, fz_identity, nullptr);
+    fz_close_device(impl_->ctx, dev);
+
+    w = fz_pixmap_width(impl_->ctx, pix);
+    h = fz_pixmap_height(impl_->ctx, pix);
+    const int stride = fz_pixmap_stride(impl_->ctx, pix);
+    const unsigned char *samples = fz_pixmap_samples(impl_->ctx, pix);
+    rgba.assign(static_cast<size_t>(w * h * 4), 255);
+    for (int y = 0; y < h; ++y) {
+      if (cancel && cancel->load()) return false;
+      const unsigned char *row = samples + y * stride;
+      for (int x = 0; x < w; ++x) {
+        const int si = x * 3;
+        const int di = (y * w + x) * 4;
+        rgba[di + 0] = row[si + 0];
+        rgba[di + 1] = row[si + 1];
+        rgba[di + 2] = row[si + 2];
+        rgba[di + 3] = 255;
+      }
+    }
+  }
+  fz_always(impl_->ctx) {
+    if (dev) fz_drop_device(impl_->ctx, dev);
+    if (pix) fz_drop_pixmap(impl_->ctx, pix);
+    if (page) fz_drop_page(impl_->ctx, page);
+  }
+  fz_catch(impl_->ctx) {
+    return false;
+  }
+  return true;
+#else
+  std::vector<unsigned char> full_rgba;
+  int full_w = 0;
+  int full_h = 0;
+  if (!RenderPageRGBA(page_index, scale, full_rgba, full_w, full_h, cancel)) return false;
+  if (full_w <= 0 || full_h <= 0) return false;
+  src_x = std::min(src_x, std::max(0, full_w - 1));
+  src_y = std::min(src_y, std::max(0, full_h - 1));
+  src_w = std::min(src_w, full_w - src_x);
+  src_h = std::min(src_h, full_h - src_y);
+  if (src_w <= 0 || src_h <= 0) return false;
+  w = src_w;
+  h = src_h;
+  rgba.assign(static_cast<size_t>(w * h * 4), 255);
+  for (int y = 0; y < h; ++y) {
+    if (cancel && cancel->load()) return false;
+    const unsigned char *src_row = full_rgba.data() + static_cast<size_t>(((src_y + y) * full_w + src_x) * 4);
+    unsigned char *dst_row = rgba.data() + static_cast<size_t>(y * w * 4);
+    std::copy(src_row, src_row + static_cast<size_t>(w * 4), dst_row);
+  }
+  return true;
+#endif
+}
+
+bool PdfReader::RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h,
+                                      const std::atomic<bool> *cancel) {
+  return RenderPageRGBA(CurrentPage(), scale, rgba, w, h, cancel);
 }

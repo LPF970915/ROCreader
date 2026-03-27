@@ -10,10 +10,12 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -29,6 +31,7 @@
 #endif
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <unordered_map>
 #include <utility>
@@ -39,6 +42,7 @@
 #include "epub_comic_reader.h"
 #include "epub_reader.h"
 #include "pdf_reader.h"
+#include "pdf_runtime.h"
 #include "storage_paths.h"
 #include "animation.h"
 
@@ -165,9 +169,9 @@ constexpr uint32_t kIdleFlushOnlyWaitMs = 250;
 constexpr size_t kBootCountBatchEntries = 96;
 constexpr size_t kBootScanBatchEntries = 48;
 constexpr size_t kBootCoverGenerateBatchEntries = 1;
-constexpr int kReaderRenderMaxDim = 4096;
-constexpr int kReaderRenderMaxPixels = 6 * 1024 * 1024;
-constexpr uint32_t kReaderRenderRetryDelayMs = 500;
+constexpr uint32_t kReaderFastFlipThresholdMs = 200;
+constexpr uint32_t kReaderPageFlipDebounceMs = 150;
+constexpr int kReaderTexturePoolSize = 6;
 constexpr int kTxtLineSpacing = 8;
 constexpr int kTxtFontPt = 22;
 constexpr size_t kTxtMaxBytes = 12 * 1024 * 1024;
@@ -600,13 +604,89 @@ enum class ReaderMode {
   Epub = 3,
 };
 
+enum class ReaderRenderQuality {
+  Low = 0,
+  Full = 1,
+};
+
 struct ReaderRenderCache {
   int page = -1;
   int rotation = 0;
   float scale = 1.0f;
+  ReaderRenderQuality quality = ReaderRenderQuality::Full;
   SDL_Texture *texture = nullptr;
   int w = 0;
   int h = 0;
+  int display_w = 0;
+  int display_h = 0;
+  uint32_t last_use = 0;
+};
+
+struct ReaderPageRenderMode {
+  int display_w = 0;
+  int display_h = 0;
+};
+
+struct ReaderViewState {
+  int page = 0;
+  float zoom = 1.0f;
+  int rotation = 0;
+
+  bool operator==(const ReaderViewState &other) const {
+    return page == other.page &&
+           rotation == other.rotation &&
+           std::abs(zoom - other.zoom) < 0.0005f;
+  }
+
+  bool operator!=(const ReaderViewState &other) const { return !(*this == other); }
+};
+
+struct ReaderAdaptiveRenderState {
+  uint32_t last_page_flip_tick = 0;
+  bool pending_page_active = false;
+  int pending_page = -1;
+  bool pending_page_top = true;
+  uint32_t pending_page_commit_tick = 0;
+  bool fast_flip_mode = false;
+  int last_scroll_dir = 1;
+};
+
+struct ReaderAsyncRenderJob {
+  bool active = false;
+  bool prefetch = false;
+  ReaderMode mode = ReaderMode::None;
+  std::string path;
+  ReaderViewState state;
+  int page = 0;
+  float target_scale = 1.0f;
+  int rotation = 0;
+  int display_w = 0;
+  int display_h = 0;
+  uint64_t serial = 0;
+};
+
+struct ReaderAsyncRenderResult {
+  bool ready = false;
+  bool success = false;
+  ReaderMode mode = ReaderMode::None;
+  std::string path;
+  ReaderViewState state;
+  int page = 0;
+  float target_scale = 1.0f;
+  int rotation = 0;
+  int display_w = 0;
+  int display_h = 0;
+  int src_w = 0;
+  int src_h = 0;
+  std::vector<unsigned char> rgba;
+  uint64_t serial = 0;
+};
+
+struct ReaderTexturePoolEntry {
+  SDL_Texture *texture = nullptr;
+  int w = 0;
+  int h = 0;
+  bool in_use = false;
   uint32_t last_use = 0;
 };
 
@@ -686,13 +766,6 @@ struct ShelfRenderCache {
   int shelf_page = -1;
   int nav_selected_index = -1;
   uint64_t content_version = 0;
-};
-
-struct ReaderRenderFailureState {
-  int page = -1;
-  int rotation = 0;
-  float scale = 0.0f;
-  uint32_t last_fail_tick = 0;
 };
 
 struct ShelfScanCacheEntry {
@@ -2203,17 +2276,31 @@ int main(int, char **) {
     if ((force || favorites_store.ShouldFlush(tick_now, kDeferredSaveDelayMs)) && favorites_store.IsDirty()) favorites_store.Save();
     if ((force || history_store.ShouldFlush(tick_now, kDeferredSaveDelayMs)) && history_store.IsDirty()) history_store.Save();
   };
-  PdfReader pdf;
+  PdfRuntime pdf_runtime;
   EpubComicReader epub_comic;
-  std::cout << "[native_h700] pdf backend: " << pdf.BackendName()
-            << " (real_renderer=" << (pdf.HasRealRenderer() ? "yes" : "no") << ")\n";
   std::cout << "[native_h700] epub comic backend: " << epub_comic.BackendName()
             << " (real_renderer=" << (epub_comic.HasRealRenderer() ? "yes" : "no") << ")\n";
   ReaderRenderCache render_cache;
   ReaderRenderCache secondary_render_cache;
-  ReaderRenderFailureState render_failure_state;
-  std::unordered_map<int, SDL_Point> pdf_page_size_cache;
-  std::unordered_map<int, float> pdf_render_scale_caps;
+  ReaderRenderCache tertiary_render_cache;
+  std::array<ReaderTexturePoolEntry, kReaderTexturePoolSize> reader_texture_pool{};
+  ReaderViewState display_state;
+  ReaderViewState target_state;
+  ReaderViewState ready_state;
+  bool display_state_valid = false;
+  bool ready_state_valid = false;
+  ReaderAdaptiveRenderState adaptive_render;
+  ReaderAsyncRenderJob reader_async_requested_job;
+  ReaderAsyncRenderJob reader_async_inflight_job;
+  ReaderAsyncRenderResult reader_async_result;
+  uint64_t reader_async_job_serial = 0;
+  uint64_t reader_async_latest_target_serial = 0;
+  std::atomic<bool> reader_async_cancel_requested{false};
+  SDL_mutex *reader_async_mutex = SDL_CreateMutex();
+  SDL_cond *reader_async_cond = SDL_CreateCond();
+  bool reader_async_worker_running = true;
+  const Uint32 reader_async_event_type = SDL_RegisterEvents(1);
+  std::unordered_map<int, SDL_Point> reader_page_size_cache;
   ShelfRenderCache shelf_render_cache;
   uint64_t shelf_content_version = 1;
 
@@ -3472,10 +3559,75 @@ int main(int, char **) {
 
   auto destroy_render_cache = [&](ReaderRenderCache &cache) {
     if (cache.texture) {
-      forget_texture_size(cache.texture);
-      SDL_DestroyTexture(cache.texture);
+      bool pooled = false;
+      for (auto &slot : reader_texture_pool) {
+        if (slot.texture == cache.texture) {
+          slot.in_use = false;
+          slot.last_use = SDL_GetTicks();
+          pooled = true;
+          break;
+        }
+      }
+      if (!pooled) {
+        forget_texture_size(cache.texture);
+        SDL_DestroyTexture(cache.texture);
+      }
     }
     cache = ReaderRenderCache{};
+  };
+
+  auto acquire_reader_texture = [&](int w, int h) -> SDL_Texture * {
+    const uint32_t now = SDL_GetTicks();
+    for (auto &slot : reader_texture_pool) {
+      if (slot.texture && !slot.in_use && slot.w == w && slot.h == h) {
+        slot.in_use = true;
+        slot.last_use = now;
+        return slot.texture;
+      }
+    }
+
+    for (auto &slot : reader_texture_pool) {
+      if (!slot.texture) {
+        SDL_Texture *tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+        if (!tex) return nullptr;
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        remember_texture_size(tex, w, h);
+        slot.texture = tex;
+        slot.w = w;
+        slot.h = h;
+        slot.in_use = true;
+        slot.last_use = now;
+        return tex;
+      }
+    }
+
+    ReaderTexturePoolEntry *evict = nullptr;
+    for (auto &slot : reader_texture_pool) {
+      if (slot.in_use) continue;
+      if (!evict || slot.last_use < evict->last_use) evict = &slot;
+    }
+    if (!evict) return nullptr;
+    if (evict->texture) {
+      forget_texture_size(evict->texture);
+      SDL_DestroyTexture(evict->texture);
+    }
+    SDL_Texture *tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+    if (!tex) {
+      evict->texture = nullptr;
+      evict->w = 0;
+      evict->h = 0;
+      evict->in_use = false;
+      evict->last_use = 0;
+      return nullptr;
+    }
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    remember_texture_size(tex, w, h);
+    evict->texture = tex;
+    evict->w = w;
+    evict->h = h;
+    evict->in_use = true;
+    evict->last_use = now;
+    return tex;
   };
 
   auto destroy_shelf_render_cache = [&]() {
@@ -3490,205 +3642,592 @@ int main(int, char **) {
     destroy_shelf_render_cache();
   };
 
-  auto stash_render_cache = [&]() {
-    if (!render_cache.texture) return;
-    destroy_render_cache(secondary_render_cache);
-    secondary_render_cache = render_cache;
-    render_cache = ReaderRenderCache{};
-  };
-
-  auto invalidate_render = [&]() {
-    destroy_render_cache(render_cache);
-    render_failure_state = ReaderRenderFailureState{};
-  };
-
   auto invalidate_all_render_cache = [&]() {
     destroy_render_cache(render_cache);
     destroy_render_cache(secondary_render_cache);
-    render_failure_state = ReaderRenderFailureState{};
+    destroy_render_cache(tertiary_render_cache);
   };
 
   auto reader_has_real_renderer = [&]() -> bool {
-    if (reader_mode == ReaderMode::Pdf) return pdf.HasRealRenderer();
+    if (reader_mode == ReaderMode::Pdf) return pdf_runtime.HasRealRenderer();
     if (reader_mode == ReaderMode::Epub) return epub_comic.HasRealRenderer();
     return false;
   };
 
   auto reader_is_open = [&]() -> bool {
-    if (reader_mode == ReaderMode::Pdf) return pdf.IsOpen();
+    if (reader_mode == ReaderMode::Pdf) return pdf_runtime.IsOpen();
     if (reader_mode == ReaderMode::Epub) return epub_comic.IsOpen();
     return false;
   };
 
   auto reader_page_count = [&]() -> int {
-    if (reader_mode == ReaderMode::Pdf) return pdf.PageCount();
+    if (reader_mode == ReaderMode::Pdf) return pdf_runtime.PageCount();
     if (reader_mode == ReaderMode::Epub) return epub_comic.PageCount();
     return 0;
   };
 
   auto reader_current_page = [&]() -> int {
-    if (reader_mode == ReaderMode::Pdf) return pdf.CurrentPage();
+    if (reader_mode == ReaderMode::Pdf) return pdf_runtime.CurrentPage();
     if (reader_mode == ReaderMode::Epub) return epub_comic.CurrentPage();
     return 0;
   };
 
   auto reader_set_page = [&](int page_index) {
-    if (reader_mode == ReaderMode::Pdf) pdf.SetPage(page_index);
+    if (reader_mode == ReaderMode::Pdf) return;
     if (reader_mode == ReaderMode::Epub) epub_comic.SetPage(page_index);
   };
 
-  auto reader_next_page = [&]() {
-    if (reader_mode == ReaderMode::Pdf) pdf.NextPage();
-    if (reader_mode == ReaderMode::Epub) epub_comic.NextPage();
-  };
-
-  auto reader_prev_page = [&]() {
-    if (reader_mode == ReaderMode::Pdf) pdf.PrevPage();
-    if (reader_mode == ReaderMode::Epub) epub_comic.PrevPage();
-  };
-
   auto reader_current_page_size = [&](int &w, int &h) -> bool {
-    if (reader_mode == ReaderMode::Pdf) return pdf.CurrentPageSize(w, h);
+    if (reader_mode == ReaderMode::Pdf) return pdf_runtime.PageSize(pdf_runtime.CurrentPage(), w, h);
     if (reader_mode == ReaderMode::Epub) return epub_comic.CurrentPageSize(w, h);
     return false;
   };
 
-  auto reader_render_current_page_rgba =
-      [&](float scale, std::vector<unsigned char> &rgba, int &w, int &h) -> bool {
-    if (reader_mode == ReaderMode::Pdf) return pdf.RenderCurrentPageRGBA(scale, rgba, w, h);
-    if (reader_mode == ReaderMode::Epub) return epub_comic.RenderCurrentPageRGBA(scale, rgba, w, h);
+  auto reader_page_size = [&](int page_index, int &w, int &h) -> bool {
+    if (reader_mode == ReaderMode::Pdf) return pdf_runtime.PageSize(page_index, w, h);
+    if (reader_mode == ReaderMode::Epub) return epub_comic.PageSize(page_index, w, h);
     return false;
   };
 
+  struct ReaderAsyncWorkerCtx {
+    SDL_mutex *mutex = nullptr;
+    SDL_cond *cond = nullptr;
+    bool *running = nullptr;
+    ReaderAsyncRenderJob *requested = nullptr;
+    ReaderAsyncRenderJob *inflight = nullptr;
+    ReaderAsyncRenderResult *result = nullptr;
+    uint64_t *latest_target_serial = nullptr;
+    std::atomic<bool> *cancel_requested = nullptr;
+    Uint32 event_type = 0;
+  };
+
+  auto reset_reader_async_state = [&]() {
+    SDL_LockMutex(reader_async_mutex);
+    reader_async_requested_job = ReaderAsyncRenderJob{};
+    reader_async_inflight_job = ReaderAsyncRenderJob{};
+    reader_async_result = ReaderAsyncRenderResult{};
+    reader_async_latest_target_serial = 0;
+    reader_async_cancel_requested.store(false);
+    SDL_UnlockMutex(reader_async_mutex);
+    ready_state_valid = false;
+  };
+
+  const auto reader_async_worker_main = [](void *userdata) -> int {
+    auto *ctx = static_cast<ReaderAsyncWorkerCtx *>(userdata);
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    EpubComicReader worker_epub;
+    ReaderMode open_mode = ReaderMode::None;
+    std::string open_path;
+
+    for (;;) {
+      SDL_LockMutex(ctx->mutex);
+      while (*ctx->running && (!ctx->requested->active || ctx->result->ready)) {
+        SDL_CondWait(ctx->cond, ctx->mutex);
+      }
+      if (!*ctx->running) {
+        SDL_UnlockMutex(ctx->mutex);
+        break;
+      }
+      ReaderAsyncRenderJob job = *ctx->requested;
+      ctx->requested->active = false;
+      *ctx->inflight = job;
+      if (!job.prefetch && ctx->cancel_requested) {
+        ctx->cancel_requested->store(false);
+      }
+      SDL_UnlockMutex(ctx->mutex);
+
+      bool success = false;
+      int src_w = 0;
+      int src_h = 0;
+      std::vector<unsigned char> rgba;
+
+      if (job.mode == ReaderMode::Epub) {
+        if (open_mode != ReaderMode::Epub || open_path != job.path) {
+          worker_epub.Close();
+          open_mode = ReaderMode::None;
+          open_path.clear();
+          if (worker_epub.Open(job.path)) {
+            open_mode = ReaderMode::Epub;
+            open_path = job.path;
+          }
+        }
+        if (open_mode == ReaderMode::Epub) {
+          success = worker_epub.RenderPageRGBA(job.page, job.target_scale, rgba, src_w, src_h, ctx->cancel_requested);
+        }
+      }
+
+      SDL_LockMutex(ctx->mutex);
+      const bool requested_differs =
+          ctx->requested->active &&
+          (ctx->requested->mode != job.mode ||
+           ctx->requested->path != job.path ||
+           ctx->requested->page != job.page ||
+           ctx->requested->rotation != job.rotation ||
+           std::abs(ctx->requested->target_scale - job.target_scale) >= 0.0005f);
+      const bool stale_job =
+          requested_differs ||
+          (!job.prefetch && job.serial != *ctx->latest_target_serial) ||
+          (job.prefetch && job.serial < *ctx->latest_target_serial);
+      if (*ctx->running && !stale_job) {
+        ReaderAsyncRenderResult next_result;
+        next_result.ready = true;
+        next_result.success = success;
+        next_result.mode = job.mode;
+        next_result.path = job.path;
+        next_result.state = job.state;
+        next_result.page = job.page;
+        next_result.target_scale = job.target_scale;
+        next_result.rotation = job.rotation;
+        next_result.display_w = job.display_w;
+        next_result.display_h = job.display_h;
+        next_result.src_w = src_w;
+        next_result.src_h = src_h;
+        next_result.rgba = std::move(rgba);
+        next_result.serial = job.serial;
+        *ctx->result = std::move(next_result);
+      }
+      *ctx->inflight = ReaderAsyncRenderJob{};
+      SDL_UnlockMutex(ctx->mutex);
+
+      if (!stale_job && ctx->event_type != static_cast<Uint32>(-1)) {
+        SDL_Event ready_event{};
+        ready_event.type = ctx->event_type;
+        SDL_PushEvent(&ready_event);
+      }
+    }
+
+    worker_epub.Close();
+    return 0;
+  };
+
+  ReaderAsyncWorkerCtx reader_async_worker_ctx{
+      reader_async_mutex,
+      reader_async_cond,
+      &reader_async_worker_running,
+      &reader_async_requested_job,
+      &reader_async_inflight_job,
+      &reader_async_result,
+      &reader_async_latest_target_serial,
+      &reader_async_cancel_requested,
+      reader_async_event_type,
+  };
+  SDL_Thread *reader_async_thread =
+      SDL_CreateThread(reader_async_worker_main, "reader_async", &reader_async_worker_ctx);
+
+  std::function<float(const ReaderViewState &)> reader_target_scale_for_state;
+
+  auto promote_async_render_result = [&]() {
+    ReaderAsyncRenderResult ready_result;
+    bool has_result = false;
+    SDL_LockMutex(reader_async_mutex);
+    if (reader_async_result.ready) {
+      ready_result = std::move(reader_async_result);
+      reader_async_result = ReaderAsyncRenderResult{};
+      has_result = true;
+      SDL_CondSignal(reader_async_cond);
+    }
+    SDL_UnlockMutex(reader_async_mutex);
+    if (!has_result) return false;
+    if (!ready_result.success) return false;
+    if (ready_result.mode != reader_mode || ready_result.path != current_book) return false;
+    if (!reader_is_open()) return false;
+    const auto result_neighbor_cache_slot = [&](int page) -> ReaderRenderCache * {
+      return (page < target_state.page) ? &secondary_render_cache : &tertiary_render_cache;
+    };
+    const int focus_page = target_state.page;
+    const bool is_target_page = ready_result.page == focus_page;
+    const bool is_neighbor_page = ready_result.page == focus_page - 1 || ready_result.page == focus_page + 1;
+    if (!is_target_page && !is_neighbor_page && (!display_state_valid || ready_result.page != display_state.page)) return false;
+    if (ready_result.rotation != target_state.rotation) return false;
+
+    const float target_scale = reader_target_scale_for_state(target_state);
+    if (std::abs(ready_result.target_scale - target_scale) >= 0.0005f) return false;
+
+    ReaderViewState result_state;
+    result_state.page = ready_result.page;
+    result_state.rotation = ready_result.rotation;
+    if (ready_result.page == target_state.page && ready_result.rotation == target_state.rotation) {
+      result_state.zoom = target_state.zoom;
+    } else if (display_state_valid &&
+               ready_result.page == display_state.page &&
+               ready_result.rotation == display_state.rotation) {
+      result_state.zoom = display_state.zoom;
+    } else {
+      result_state.zoom = target_state.zoom;
+    }
+    if (result_state == target_state) {
+      ready_state = result_state;
+      ready_state_valid = true;
+    }
+
+    int rw = ready_result.src_w;
+    int rh = ready_result.src_h;
+    std::vector<unsigned char> rot;
+    const std::vector<unsigned char> &rgba = ready_result.rgba;
+    if (ready_result.rotation == 90 || ready_result.rotation == 270) {
+      rw = ready_result.src_h;
+      rh = ready_result.src_w;
+      rot.assign(static_cast<size_t>(rw * rh * 4), 0);
+      for (int y = 0; y < ready_result.src_h; ++y) {
+        for (int x = 0; x < ready_result.src_w; ++x) {
+          const int src = (y * ready_result.src_w + x) * 4;
+          int dx = 0, dy = 0;
+          if (ready_result.rotation == 90) { dx = ready_result.src_h - 1 - y; dy = x; }
+          else { dx = y; dy = ready_result.src_w - 1 - x; }
+          const int dst = (dy * rw + dx) * 4;
+          rot[dst + 0] = rgba[src + 0];
+          rot[dst + 1] = rgba[src + 1];
+          rot[dst + 2] = rgba[src + 2];
+          rot[dst + 3] = rgba[src + 3];
+        }
+      }
+    } else if (ready_result.rotation == 180) {
+      rot.assign(static_cast<size_t>(rw * rh * 4), 0);
+      for (int y = 0; y < ready_result.src_h; ++y) {
+        for (int x = 0; x < ready_result.src_w; ++x) {
+          const int src = (y * ready_result.src_w + x) * 4;
+          const int dx = ready_result.src_w - 1 - x;
+          const int dy = ready_result.src_h - 1 - y;
+          const int dst = (dy * rw + dx) * 4;
+          rot[dst + 0] = rgba[src + 0];
+          rot[dst + 1] = rgba[src + 1];
+          rot[dst + 2] = rgba[src + 2];
+          rot[dst + 3] = rgba[src + 3];
+        }
+      }
+    }
+
+    const unsigned char *pixels = (ready_result.rotation == 0) ? rgba.data() : rot.data();
+    SDL_Texture *tex = acquire_reader_texture(rw, rh);
+    if (!tex) return false;
+    if (SDL_UpdateTexture(tex, nullptr, pixels, rw * 4) != 0) {
+      for (auto &slot : reader_texture_pool) {
+        if (slot.texture == tex) {
+          slot.in_use = false;
+          slot.last_use = SDL_GetTicks();
+          break;
+        }
+      }
+      return false;
+    }
+    const uint32_t stamp = SDL_GetTicks();
+    ReaderRenderCache fresh_cache;
+    fresh_cache.texture = tex;
+    fresh_cache.page = ready_result.page;
+    fresh_cache.rotation = ready_result.rotation;
+    fresh_cache.scale = ready_result.target_scale;
+    fresh_cache.quality = ReaderRenderQuality::Full;
+    fresh_cache.w = rw;
+    fresh_cache.h = rh;
+    fresh_cache.display_w = ready_result.display_w;
+    fresh_cache.display_h = ready_result.display_h;
+    fresh_cache.last_use = stamp;
+
+    if (display_state_valid && result_state == display_state &&
+        std::abs(ready_result.target_scale - render_cache.scale) < 0.0005f) {
+      destroy_render_cache(render_cache);
+      render_cache = fresh_cache;
+    } else {
+      ReaderRenderCache *target_cache = result_neighbor_cache_slot(ready_result.page);
+      destroy_render_cache(*target_cache);
+      *target_cache = fresh_cache;
+    }
+    return true;
+  };
+
+  auto request_reader_async_render = [&](int page, float target_scale, int display_w, int display_h, bool prefetch) -> bool {
+    ReaderAsyncRenderJob next_job;
+    next_job.active = true;
+    next_job.prefetch = prefetch;
+    next_job.mode = reader_mode;
+    next_job.path = current_book;
+    next_job.state = target_state;
+    next_job.page = page;
+    next_job.target_scale = target_scale;
+    next_job.rotation = target_state.rotation;
+    next_job.display_w = display_w;
+    next_job.display_h = display_h;
+    next_job.serial = ++reader_async_job_serial;
+    if (next_job.serial == 0) next_job.serial = ++reader_async_job_serial;
+
+    SDL_LockMutex(reader_async_mutex);
+    if (!prefetch) {
+      reader_async_latest_target_serial = next_job.serial;
+      reader_async_cancel_requested.store(true);
+    }
+    const bool inflight_same =
+        reader_async_inflight_job.active &&
+        reader_async_inflight_job.mode == next_job.mode &&
+        reader_async_inflight_job.path == next_job.path &&
+        reader_async_inflight_job.page == next_job.page &&
+        reader_async_inflight_job.rotation == next_job.rotation &&
+        std::abs(reader_async_inflight_job.target_scale - next_job.target_scale) < 0.0005f;
+    const bool requested_same =
+        reader_async_requested_job.active &&
+        reader_async_requested_job.mode == next_job.mode &&
+        reader_async_requested_job.path == next_job.path &&
+        reader_async_requested_job.page == next_job.page &&
+        reader_async_requested_job.rotation == next_job.rotation &&
+        std::abs(reader_async_requested_job.target_scale - next_job.target_scale) < 0.0005f;
+    const bool busy_with_target =
+        reader_async_requested_job.active || (reader_async_inflight_job.active && !reader_async_inflight_job.prefetch);
+    const bool keep_requested = next_job.prefetch && reader_async_requested_job.active;
+    const bool allow_prefetch =
+        (prefetch &&
+        display_state_valid &&
+        display_state == target_state &&
+        !ready_state_valid &&
+        !busy_with_target &&
+        !reader_async_inflight_job.active);
+    const bool allow_request = prefetch ? allow_prefetch : true;
+    bool accepted = false;
+    if (allow_request && !inflight_same && !requested_same && !keep_requested) {
+      reader_async_requested_job = std::move(next_job);
+      SDL_CondSignal(reader_async_cond);
+      accepted = true;
+    }
+    SDL_UnlockMutex(reader_async_mutex);
+    return accepted;
+  };
+
+  auto reader_page_size_cached = [&](int page_index, int &w, int &h) -> bool {
+    auto it = reader_page_size_cache.find(page_index);
+    if (it != reader_page_size_cache.end() && it->second.x > 0 && it->second.y > 0) {
+      w = it->second.x;
+      h = it->second.y;
+      return true;
+    }
+    if (!reader_page_size(page_index, w, h) || w <= 0 || h <= 0) return false;
+    reader_page_size_cache[page_index] = SDL_Point{w, h};
+    return true;
+  };
+
+  auto visible_reader_render_cache = [&]() -> const ReaderRenderCache * {
+    if (render_cache.texture &&
+        display_state_valid &&
+        render_cache.page == display_state.page &&
+        render_cache.rotation == display_state.rotation) {
+      return &render_cache;
+    }
+    return nullptr;
+  };
+
+  auto matching_reader_render_cache = [&](int page, int rotation, float target_scale, ReaderRenderQuality quality)
+      -> ReaderRenderCache * {
+    ReaderRenderCache *caches[3] = {&render_cache, &secondary_render_cache, &tertiary_render_cache};
+    for (ReaderRenderCache *cache : caches) {
+      if (!cache->texture) continue;
+      if (cache->page != page || cache->rotation != rotation || cache->quality != quality) continue;
+      if (std::abs(cache->scale - target_scale) >= 0.0005f) continue;
+      return cache;
+    }
+    return nullptr;
+  };
+
+  auto visible_reader_render_cache_for_page = [&](int page, int rotation, float target_scale) -> const ReaderRenderCache * {
+    if (render_cache.texture &&
+        display_state_valid &&
+        render_cache.page == page &&
+        render_cache.rotation == rotation &&
+        std::abs(render_cache.scale - target_scale) < 0.0005f) {
+      return &render_cache;
+    }
+    return nullptr;
+  };
+
+  auto neighbor_cache_slot_for_page = [&](int page) -> ReaderRenderCache * {
+    return (page < target_state.page) ? &secondary_render_cache : &tertiary_render_cache;
+  };
+
+  auto effective_display_size = [&](int page, int rotation, float target_scale, int &out_w, int &out_h) -> bool {
+    int pw = 0, ph = 0;
+    if (!reader_page_size_cached(page, pw, ph)) return false;
+    const int base_w = std::max(1, static_cast<int>(std::round(static_cast<float>(pw) * target_scale)));
+    const int base_h = std::max(1, static_cast<int>(std::round(static_cast<float>(ph) * target_scale)));
+    if (rotation == 90 || rotation == 270) {
+      out_w = base_h;
+      out_h = base_w;
+    } else {
+      out_w = base_w;
+      out_h = base_h;
+    }
+    return true;
+  };
+
+  reader_target_scale_for_state = [&](const ReaderViewState &state) -> float {
+    int pw = 0;
+    int ph = 0;
+    if (!reader_page_size_cached(state.page, pw, ph) || pw <= 0 || ph <= 0) {
+      return std::max(0.1f, std::min(6.0f, state.zoom));
+    }
+    float auto_scale = 1.0f;
+    if (state.rotation == 0 || state.rotation == 180) {
+      auto_scale = std::max(0.1f, static_cast<float>(Layout().screen_w) / static_cast<float>(pw));
+    } else {
+      const float fit_h = static_cast<float>(Layout().screen_h) / static_cast<float>(pw);
+      const float need_overflow = static_cast<float>(Layout().screen_w + 200) / static_cast<float>(ph);
+      auto_scale = std::max(0.1f, std::max(fit_h, need_overflow));
+    }
+    return std::max(0.1f, std::min(6.0f, auto_scale * state.zoom));
+  };
+
+  auto effective_display_size_for_state = [&](const ReaderViewState &state, int &out_w, int &out_h) -> bool {
+    const float target_scale = reader_target_scale_for_state(state);
+    return effective_display_size(state.page, state.rotation, target_scale, out_w, out_h);
+  };
+
+  auto reader_page_render_mode_for_state = [&](const ReaderViewState &state) -> ReaderPageRenderMode {
+    ReaderPageRenderMode mode;
+    if (!reader_is_open()) return mode;
+    const float target_scale = reader_target_scale_for_state(state);
+    if (!effective_display_size(state.page, state.rotation, target_scale, mode.display_w, mode.display_h)) {
+      mode.display_w = Layout().screen_w;
+      mode.display_h = Layout().screen_h;
+    }
+    return mode;
+  };
+
+  auto prune_reader_neighbor_caches = [&](int center_page, int rotation, float target_scale) {
+    ReaderRenderCache *neighbors[2] = {&secondary_render_cache, &tertiary_render_cache};
+    for (ReaderRenderCache *cache : neighbors) {
+      if (!cache->texture) continue;
+      const bool keep_page =
+          (cache->page == center_page) ||
+          (cache->page == center_page - 1) ||
+          (cache->page == center_page + 1);
+      const bool keep_rotation = cache->rotation == rotation;
+      const bool keep_scale = std::abs(cache->scale - target_scale) < 0.0005f;
+      const bool keep_quality = cache->quality == ReaderRenderQuality::Full;
+      if (!keep_page || !keep_rotation || !keep_scale || !keep_quality) {
+        destroy_render_cache(*cache);
+      }
+    }
+  };
+
   auto current_reader_axis_sign = [&]() {
-    if (reader.rotation == 0) return std::pair<int, int>{1, 1};   // axis 1=y, sign +1
-    if (reader.rotation == 90) return std::pair<int, int>{0, -1}; // axis 0=x, sign -1
-    if (reader.rotation == 180) return std::pair<int, int>{1, -1};
+    if (target_state.rotation == 0) return std::pair<int, int>{1, 1};   // axis 1=y, sign +1
+    if (target_state.rotation == 90) return std::pair<int, int>{0, -1}; // axis 0=x, sign -1
+    if (target_state.rotation == 180) return std::pair<int, int>{1, -1};
     return std::pair<int, int>{0, 1};
   };
 
-  auto get_auto_scale = [&]() -> float {
-    int pw = 0, ph = 0;
-    if (!reader_current_page_size(pw, ph) || pw <= 0 || ph <= 0) return 1.0f;
-    if (reader.rotation == 0 || reader.rotation == 180) {
-      return std::max(0.1f, static_cast<float>(Layout().screen_w) / static_cast<float>(pw));
+  auto current_reader_display_size = [&](int &out_w, int &out_h) -> bool {
+    if (!reader_is_open()) return false;
+    if (effective_display_size_for_state(target_state, out_w, out_h)) return true;
+    if (display_state_valid) return effective_display_size_for_state(display_state, out_w, out_h);
+    return false;
+  };
+
+  auto promote_ready_target_to_display = [&](float target_scale, ReaderRenderQuality quality) -> bool {
+    if (!ready_state_valid || ready_state != target_state) return false;
+    ReaderRenderCache *cached =
+        matching_reader_render_cache(target_state.page, target_state.rotation, target_scale, quality);
+    if (!cached) return false;
+    if (cached != &render_cache) {
+      ReaderRenderCache previous_display = render_cache;
+      render_cache = *cached;
+      *cached = previous_display;
     }
-    const float fit_h = static_cast<float>(Layout().screen_h) / static_cast<float>(pw);
-    const float need_overflow = static_cast<float>(Layout().screen_w + 200) / static_cast<float>(ph);
-    return std::max(0.1f, std::max(fit_h, need_overflow));
+    render_cache.last_use = SDL_GetTicks();
+    display_state = target_state;
+    display_state_valid = true;
+    ready_state_valid = false;
+    return true;
   };
 
   auto ensure_render = [&]() {
     if (!reader_is_open()) return false;
-    const int page = reader_current_page();
-    float final_scale = std::max(0.1f, std::min(6.0f, get_auto_scale() * reader.zoom));
-    if (render_cache.texture && render_cache.page == page && render_cache.rotation == reader.rotation &&
-        std::abs(render_cache.scale - final_scale) < 0.0005f) {
+    promote_async_render_result();
+    const int page = target_state.page;
+    const float target_scale = reader_target_scale_for_state(target_state);
+    int display_w = 0;
+    int display_h = 0;
+    if (!effective_display_size(page, target_state.rotation, target_scale, display_w, display_h)) {
+      display_w = Layout().screen_w;
+      display_h = Layout().screen_h;
+    }
+    constexpr ReaderRenderQuality quality = ReaderRenderQuality::Full;
+    prune_reader_neighbor_caches(page, target_state.rotation, target_scale);
+    const bool display_matches_target =
+        display_state_valid &&
+        display_state.page == target_state.page &&
+        display_state.rotation == target_state.rotation &&
+        std::abs(display_state.zoom - target_state.zoom) < 0.0005f &&
+        render_cache.texture &&
+        render_cache.page == page &&
+        render_cache.rotation == target_state.rotation &&
+        render_cache.quality == quality &&
+        std::abs(render_cache.scale - target_scale) < 0.0005f;
+
+    if (!display_matches_target) {
+      if (!promote_ready_target_to_display(target_scale, quality)) {
+        request_reader_async_render(page, target_scale, display_w, display_h, false);
+        return display_state_valid && render_cache.texture;
+      }
+    } else {
       render_cache.last_use = SDL_GetTicks();
-      return true;
     }
-    if (secondary_render_cache.texture &&
-        secondary_render_cache.page == page &&
-        secondary_render_cache.rotation == reader.rotation &&
-        std::abs(secondary_render_cache.scale - final_scale) < 0.0005f) {
-      ReaderRenderCache tmp = render_cache;
-      render_cache = secondary_render_cache;
-      secondary_render_cache = tmp;
-      render_cache.last_use = SDL_GetTicks();
-      return true;
-    }
-    stash_render_cache();
 
-    std::vector<unsigned char> rgba;
-    int sw = 0, sh = 0;
-    float rendered_scale = final_scale;
-    bool rendered = false;
-    for (int attempt = 0; attempt < 4; ++attempt) {
-      rgba.clear();
-      sw = 0;
-      sh = 0;
-      if (reader_render_current_page_rgba(rendered_scale, rgba, sw, sh) && sw > 0 && sh > 0) {
-        rendered = true;
-        break;
-      }
-      if (rendered_scale <= 0.11f) break;
-      rendered_scale = std::max(0.1f, rendered_scale * 0.7f);
-    }
-    if (!rendered) return false;
-
-    // Software rotate to keep scroll-axis math straightforward.
-    int rw = sw, rh = sh;
-    std::vector<unsigned char> rot;
-    if (reader.rotation == 90 || reader.rotation == 270) {
-      rw = sh;
-      rh = sw;
-      rot.assign(static_cast<size_t>(rw * rh * 4), 0);
-      for (int y = 0; y < sh; ++y) {
-        for (int x = 0; x < sw; ++x) {
-          int src = (y * sw + x) * 4;
-          int dx = 0, dy = 0;
-          if (reader.rotation == 90) { dx = sh - 1 - y; dy = x; }
-          else { dx = y; dy = sw - 1 - x; } // 270
-          int dst = (dy * rw + dx) * 4;
-          rot[dst + 0] = rgba[src + 0];
-          rot[dst + 1] = rgba[src + 1];
-          rot[dst + 2] = rgba[src + 2];
-          rot[dst + 3] = rgba[src + 3];
-        }
-      }
-    } else if (reader.rotation == 180) {
-      rw = sw;
-      rh = sh;
-      rot.assign(static_cast<size_t>(rw * rh * 4), 0);
-      for (int y = 0; y < sh; ++y) {
-        for (int x = 0; x < sw; ++x) {
-          int src = (y * sw + x) * 4;
-          int dx = sw - 1 - x;
-          int dy = sh - 1 - y;
-          int dst = (dy * rw + dx) * 4;
-          rot[dst + 0] = rgba[src + 0];
-          rot[dst + 1] = rgba[src + 1];
-          rot[dst + 2] = rgba[src + 2];
-          rot[dst + 3] = rgba[src + 3];
-        }
+    if (!display_state_valid) {
+      if (!promote_ready_target_to_display(target_scale, quality)) {
+        request_reader_async_render(page, target_scale, display_w, display_h, false);
+        return false;
       }
     }
 
-    const unsigned char *pixels = (reader.rotation == 0) ? rgba.data() : rot.data();
-    SDL_Texture *tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, rw, rh);
-    if (!tex) return false;
-    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
-    if (SDL_UpdateTexture(tex, nullptr, pixels, rw * 4) != 0) {
-      forget_texture_size(tex);
-      SDL_DestroyTexture(tex);
-      return false;
+    if (adaptive_render.pending_page_active) return true;
+
+    const int page_count = std::max(1, reader_page_count());
+    const int next_page = page + 1;
+    const int prev_page = page - 1;
+    if (next_page < page_count &&
+        !matching_reader_render_cache(next_page, target_state.rotation, target_scale, quality)) {
+      int next_display_w = 0;
+      int next_display_h = 0;
+      if (effective_display_size(next_page, target_state.rotation, target_scale, next_display_w, next_display_h)) {
+        request_reader_async_render(next_page, target_scale, next_display_w, next_display_h, true);
+      }
+    } else if (prev_page >= 0 &&
+               !matching_reader_render_cache(prev_page, target_state.rotation, target_scale, quality)) {
+      int prev_display_w = 0;
+      int prev_display_h = 0;
+      if (effective_display_size(prev_page, target_state.rotation, target_scale, prev_display_w, prev_display_h)) {
+        request_reader_async_render(prev_page, target_scale, prev_display_w, prev_display_h, true);
+      }
     }
-    remember_texture_size(tex, rw, rh);
-    render_cache.texture = tex;
-    render_cache.page = page;
-    render_cache.rotation = reader.rotation;
-    render_cache.scale = rendered_scale;
-    render_cache.w = rw;
-    render_cache.h = rh;
-    render_cache.last_use = SDL_GetTicks();
     return true;
   };
 
   auto clamp_scroll = [&]() {
-    if (!ensure_render()) {
-      reader.scroll_x = reader.scroll_y = 0;
-      return;
+    int display_w = 0;
+    int display_h = 0;
+    if (!current_reader_display_size(display_w, display_h)) {
+      if (const ReaderRenderCache *cache = visible_reader_render_cache()) {
+        display_w = cache->display_w;
+        display_h = cache->display_h;
+      } else {
+        reader.scroll_x = reader.scroll_y = 0;
+        return;
+      }
     }
-    const int max_x = std::max(0, render_cache.w - Layout().screen_w);
-    const int max_y = std::max(0, render_cache.h - Layout().screen_h);
+    const int max_x = std::max(0, display_w - Layout().screen_w);
+    const int max_y = std::max(0, display_h - Layout().screen_h);
     reader.scroll_x = ClampInt(reader.scroll_x, 0, max_x);
     reader.scroll_y = ClampInt(reader.scroll_y, 0, max_y);
   };
 
   auto set_scroll_edge = [&](bool top) {
     clamp_scroll();
-    const int max_x = std::max(0, render_cache.w - Layout().screen_w);
-    const int max_y = std::max(0, render_cache.h - Layout().screen_h);
+    int display_w = 0;
+    int display_h = 0;
+    if (!current_reader_display_size(display_w, display_h)) {
+      if (const ReaderRenderCache *cache = visible_reader_render_cache()) {
+        display_w = cache->display_w;
+        display_h = cache->display_h;
+      }
+    }
+    const int max_x = std::max(0, display_w - Layout().screen_w);
+    const int max_y = std::max(0, display_h - Layout().screen_h);
     const auto [axis, sign] = current_reader_axis_sign();
     if (axis == 1) {
       reader.scroll_x = 0;
@@ -3701,31 +4240,93 @@ int main(int, char **) {
     }
   };
 
-  auto go_next_page = [&]() {
-    const int old = reader_current_page();
-    reader_next_page();
-    if (reader_current_page() != old) {
-      stash_render_cache();
-      set_scroll_edge(true);
+  auto commit_target_view = [&](ReaderViewState next_state, bool align_to_edge, bool edge_top) {
+    if (!reader_is_open()) return;
+    const int page_count = std::max(1, reader_page_count());
+    next_state.page = ClampInt(next_state.page, 0, page_count - 1);
+    next_state.zoom = std::max(0.25f, std::min(6.0f, next_state.zoom));
+    next_state.rotation %= 360;
+    if (next_state.rotation < 0) next_state.rotation += 360;
+    next_state.rotation = ((next_state.rotation + 45) / 90) * 90;
+    next_state.rotation %= 360;
+
+    const ReaderViewState previous_state = target_state;
+    const bool target_changed = next_state != previous_state;
+    const bool page_changed = next_state.page != previous_state.page;
+    if (target_changed) {
+      SDL_LockMutex(reader_async_mutex);
+      reader_async_latest_target_serial = ++reader_async_job_serial;
+      reader_async_cancel_requested.store(true);
+      SDL_UnlockMutex(reader_async_mutex);
+      ready_state = ReaderViewState{};
+      ready_state_valid = false;
     }
-  };
-  auto go_prev_page = [&]() {
-    const int old = reader_current_page();
-    reader_prev_page();
-    if (reader_current_page() != old) {
-      stash_render_cache();
-      set_scroll_edge(false);
+    if (page_changed) {
+      reader_set_page(next_state.page);
+      reader.scroll_x = 0;
+      reader.scroll_y = 0;
+    }
+    reader.rotation = next_state.rotation;
+    reader.zoom = next_state.zoom;
+    target_state = next_state;
+
+    if (align_to_edge) set_scroll_edge(edge_top);
+    else clamp_scroll();
+
+    if (page_changed) {
+      adaptive_render.pending_page_active = false;
+      adaptive_render.fast_flip_mode = false;
     }
   };
 
+  auto queue_page_flip = [&](int page_action) {
+    if (page_action == 0 || !reader_is_open()) return;
+    const uint32_t now = SDL_GetTicks();
+    const bool rapid_flip =
+        adaptive_render.pending_page_active ||
+        (adaptive_render.last_page_flip_tick > 0 &&
+         now - adaptive_render.last_page_flip_tick <= kReaderFastFlipThresholdMs);
+    const int page_count = std::max(1, reader_page_count());
+    const int base_page = adaptive_render.pending_page_active ? adaptive_render.pending_page : target_state.page;
+    const int target_page = ClampInt(base_page + page_action, 0, page_count - 1);
+    if (target_page == base_page) return;
+    adaptive_render.pending_page_active = true;
+    adaptive_render.pending_page = target_page;
+    adaptive_render.pending_page_top = (page_action > 0);
+    adaptive_render.pending_page_commit_tick = now + kReaderPageFlipDebounceMs;
+    adaptive_render.fast_flip_mode = rapid_flip;
+    adaptive_render.last_page_flip_tick = now;
+  };
+
+  auto flush_pending_page_flip = [&]() {
+    if (!adaptive_render.pending_page_active || !reader_is_open()) return;
+    const uint32_t now = SDL_GetTicks();
+    if (now < adaptive_render.pending_page_commit_tick) return;
+    adaptive_render.pending_page_active = false;
+    adaptive_render.fast_flip_mode = false;
+    const ReaderViewState current_view = target_state;
+    const int current_page = current_view.page;
+    const int target_page = ClampInt(adaptive_render.pending_page, 0, std::max(0, reader_page_count() - 1));
+    if (target_page == current_page) return;
+    ReaderViewState next_view = current_view;
+    next_view.page = target_page;
+    commit_target_view(next_view, true, adaptive_render.pending_page_top);
+  };
+
+  auto flush_pending_page_flip_now = [&]() {
+    if (!adaptive_render.pending_page_active) return;
+    adaptive_render.pending_page_commit_tick = 0;
+    flush_pending_page_flip();
+  };
+
   auto long_dir_for_button = [&](Button b) -> int {
-    if (reader.rotation == 0) {
+    if (target_state.rotation == 0) {
       if (b == Button::Down) return 1;
       if (b == Button::Up) return -1;
-    } else if (reader.rotation == 270) {
+    } else if (target_state.rotation == 270) {
       if (b == Button::Right) return 1;
       if (b == Button::Left) return -1;
-    } else if (reader.rotation == 90) {
+    } else if (target_state.rotation == 90) {
       if (b == Button::Left) return 1;
       if (b == Button::Right) return -1;
     } else {
@@ -3741,13 +4342,13 @@ int main(int, char **) {
     // rot 90:  Up/Down flip pages
     // rot 180: Left/Right flip pages (reversed)
     // rot 270: Up/Down flip pages (reversed)
-    if (reader.rotation == 0) {
+    if (target_state.rotation == 0) {
       if (b == Button::Right) return 1;
       if (b == Button::Left) return -1;
-    } else if (reader.rotation == 90) {
+    } else if (target_state.rotation == 90) {
       if (b == Button::Down) return 1;
       if (b == Button::Up) return -1;
-    } else if (reader.rotation == 180) {
+    } else if (target_state.rotation == 180) {
       if (b == Button::Left) return 1;
       if (b == Button::Right) return -1;
     } else { // 270
@@ -3759,9 +4360,20 @@ int main(int, char **) {
 
   auto scroll_by_dir = [&](int dir, int step_px) {
     if (!ensure_render()) return;
+    adaptive_render.last_scroll_dir = (dir >= 0) ? 1 : -1;
     const auto [axis, sign] = current_reader_axis_sign();
-    const int max_x = std::max(0, render_cache.w - Layout().screen_w);
-    const int max_y = std::max(0, render_cache.h - Layout().screen_h);
+    int display_w = 0;
+    int display_h = 0;
+    if (!current_reader_display_size(display_w, display_h)) {
+      if (const ReaderRenderCache *cache = visible_reader_render_cache()) {
+        display_w = cache->display_w;
+        display_h = cache->display_h;
+      } else {
+        return;
+      }
+    }
+    const int max_x = std::max(0, display_w - Layout().screen_w);
+    const int max_y = std::max(0, display_h - Layout().screen_h);
     int *pos = (axis == 1) ? &reader.scroll_y : &reader.scroll_x;
     int max_pos = (axis == 1) ? max_y : max_x;
     int old = *pos;
@@ -3770,19 +4382,21 @@ int main(int, char **) {
     if (*pos != old) return;
     if (hold_cooldown > 0.0f) return;
     if (dir > 0) {
-      int oldp = reader_current_page();
-      reader_next_page();
-      if (reader_current_page() != oldp) {
-        stash_render_cache();
-        set_scroll_edge(true);
+      const ReaderViewState current_view = target_state;
+      const int target_page = ClampInt(current_view.page + 1, 0, std::max(0, reader_page_count() - 1));
+      if (target_page != current_view.page) {
+        ReaderViewState next_view = current_view;
+        next_view.page = target_page;
+        commit_target_view(next_view, true, true);
         hold_cooldown = 0.16f;
       }
     } else {
-      int oldp = reader_current_page();
-      reader_prev_page();
-      if (reader_current_page() != oldp) {
-        stash_render_cache();
-        set_scroll_edge(false);
+      const ReaderViewState current_view = target_state;
+      const int target_page = ClampInt(current_view.page - 1, 0, std::max(0, reader_page_count() - 1));
+      if (target_page != current_view.page) {
+        ReaderViewState next_view = current_view;
+        next_view.page = target_page;
+        commit_target_view(next_view, true, false);
         hold_cooldown = 0.16f;
       }
     }
@@ -3860,7 +4474,6 @@ int main(int, char **) {
 
     size_t end = line.size();
     while (end > start) {
-      size_t len = 0;
       size_t probe = end - 1;
       if (probe >= 2 &&
           static_cast<unsigned char>(line[probe - 2]) == 0xE3 &&
@@ -4488,7 +5101,7 @@ int main(int, char **) {
             item.is_dir = false;
             if (!has_manual_cover_exact_or_fuzzy(item) &&
                 !has_cached_pdf_cover_on_disk(book_path) &&
-                pdf.HasRealRenderer()) {
+                pdf_runtime.HasRealRenderer()) {
               boot_cover_generate_queue.push_back(book_path);
             }
           }
@@ -4702,17 +5315,28 @@ int main(int, char **) {
           if (ext == ".txt") {
             opened = open_text_book(current_book);
           } else if (ext == ".pdf") {
-            if (pdf.Open(current_book)) {
-              pdf_page_size_cache.clear();
-              pdf_render_scale_caps.clear();
+            PdfRuntimeProgress pdf_progress;
+            pdf_progress.page = reader.page;
+            pdf_progress.rotation = reader.rotation;
+            pdf_progress.zoom = reader.zoom;
+            pdf_progress.scroll_y = reader.scroll_y;
+            if (pdf_runtime.Open(renderer, current_book, Layout().screen_w, Layout().screen_h, pdf_progress)) {
+              reader_page_size_cache.clear();
+              adaptive_render = ReaderAdaptiveRenderState{};
+              reset_reader_async_state();
               close_text_reader();
               reader_mode = ReaderMode::Pdf;
-              pdf.SetPage(reader.page);
               invalidate_all_render_cache();
+              display_state = ReaderViewState{};
+              ready_state = ReaderViewState{};
+              display_state_valid = false;
+              ready_state_valid = false;
+              const PdfRuntimeProgress active_pdf = pdf_runtime.Progress();
+              target_state = ReaderViewState{active_pdf.page, active_pdf.zoom, active_pdf.rotation};
               clamp_scroll();
               opened = true;
             }
-            if (!opened && !pdf.HasRealRenderer()) {
+            if (!opened && !pdf_runtime.HasRealRenderer()) {
               if (!warned_mock_pdf_backend) {
                 std::cerr << "[reader] blocked: current build has no real document backend. "
                              "Please rebuild with REQUIRE_MUPDF=1 and install MuPDF (preferred) or poppler-cpp.\n";
@@ -4721,13 +5345,19 @@ int main(int, char **) {
             }
           } else if (ext == ".epub") {
             if (epub_comic.Open(current_book)) {
-              pdf_page_size_cache.clear();
-              pdf_render_scale_caps.clear();
+              reader_page_size_cache.clear();
+              adaptive_render = ReaderAdaptiveRenderState{};
+              reset_reader_async_state();
               close_text_reader();
-              pdf.Close();
+              pdf_runtime.Close();
               reader_mode = ReaderMode::Epub;
               epub_comic.SetPage(reader.page);
               invalidate_all_render_cache();
+              display_state = ReaderViewState{};
+              ready_state = ReaderViewState{};
+              display_state_valid = false;
+              ready_state_valid = false;
+              target_state = ReaderViewState{reader_current_page(), reader.zoom, reader.rotation};
               clamp_scroll();
               opened = true;
             }
@@ -4755,10 +5385,9 @@ int main(int, char **) {
             }
             current_book.clear();
             close_text_reader();
-            pdf.Close();
+            pdf_runtime.Close();
             epub_comic.Close();
-            pdf_page_size_cache.clear();
-            pdf_render_scale_caps.clear();
+            reader_page_size_cache.clear();
             invalidate_all_render_cache();
           }
           for (auto &v : hold_speed) v = 0.0f;
@@ -4833,8 +5462,13 @@ int main(int, char **) {
       }
     } else if (state == State::Reader) {
       if (input.IsJustPressed(Button::B)) {
-        if (reader_mode == ReaderMode::Pdf && pdf.IsOpen()) {
-          reader.page = pdf.CurrentPage();
+        if (reader_mode != ReaderMode::Txt) flush_pending_page_flip_now();
+        if (reader_mode == ReaderMode::Pdf && pdf_runtime.IsOpen()) {
+          const PdfRuntimeProgress active_pdf = pdf_runtime.Progress();
+          reader.page = active_pdf.page;
+          reader.scroll_y = active_pdf.scroll_y;
+          reader.zoom = active_pdf.zoom;
+          reader.rotation = active_pdf.rotation;
         } else if (reader_mode == ReaderMode::Epub && epub_comic.IsOpen()) {
           reader.page = epub_comic.CurrentPage();
         } else if (reader_mode == ReaderMode::Txt && txt_reader.open) {
@@ -4844,20 +5478,24 @@ int main(int, char **) {
           persist_current_txt_resume_snapshot(current_book, true);
         }
         ReaderProgress save_reader = reader;
-        if (reader_mode == ReaderMode::Pdf) save_reader.rotation = 0;
         progress.Set(current_book, save_reader);
         if (reader_mode == ReaderMode::Pdf) {
-          pdf.Close();
-          pdf_page_size_cache.clear();
-          pdf_render_scale_caps.clear();
+          pdf_runtime.Close();
+          reader_page_size_cache.clear();
+          reset_reader_async_state();
         } else if (reader_mode == ReaderMode::Epub) {
           epub_comic.Close();
-          pdf_page_size_cache.clear();
-          pdf_render_scale_caps.clear();
+          reader_page_size_cache.clear();
+          reset_reader_async_state();
         } else if (reader_mode == ReaderMode::Txt) {
           close_text_reader();
         }
         invalidate_all_render_cache();
+        display_state = ReaderViewState{};
+        ready_state = ReaderViewState{};
+        target_state = ReaderViewState{};
+        display_state_valid = false;
+        ready_state_valid = false;
         reader_mode = ReaderMode::None;
         reader_progress_overlay_visible = false;
         state = State::Shelf;
@@ -4910,12 +5548,122 @@ int main(int, char **) {
           }
           reader.page = (txt_reader.line_h > 0) ? (txt_reader.scroll_px / txt_reader.line_h) : 0;
           reader.scroll_y = txt_reader.scroll_px;
+        } else if (reader_mode == ReaderMode::Pdf) {
+          const int pdf_rotation = pdf_runtime.Progress().rotation;
+          auto pdf_long_dir_for_button = [&](Button b) -> int {
+            if (pdf_rotation == 0) {
+              if (b == Button::Down) return 1;
+              if (b == Button::Up) return -1;
+            } else if (pdf_rotation == 90) {
+              if (b == Button::Left) return 1;   // left -> scroll down
+              if (b == Button::Right) return -1; // right -> scroll up
+            } else if (pdf_rotation == 180) {
+              if (b == Button::Up) return 1;
+              if (b == Button::Down) return -1;
+            } else { // 270
+              if (b == Button::Left) return -1;  // left -> scroll up
+              if (b == Button::Right) return 1;  // right -> scroll down
+            }
+            return 0;
+          };
+          auto pdf_tap_page_action_for_button = [&](Button b) -> int {
+            if (pdf_rotation == 0) {
+              if (b == Button::Right) return 1;
+              if (b == Button::Left) return -1;
+            } else if (pdf_rotation == 90) {
+              if (b == Button::Up) return -1;    // up -> previous page
+              if (b == Button::Down) return 1;   // down -> next page
+            } else if (pdf_rotation == 180) {
+              if (b == Button::Left) return 1;   // left -> next page
+              if (b == Button::Right) return -1; // right -> previous page
+            } else { // 270
+              if (b == Button::Up) return 1;     // up -> next page
+              if (b == Button::Down) return -1;  // down -> previous page
+            }
+            return 0;
+          };
+          if (input.IsJustPressed(Button::L2)) {
+            pdf_runtime.RotateLeft();
+          }
+          if (input.IsJustPressed(Button::R2)) {
+            pdf_runtime.RotateRight();
+          }
+          if (input.IsJustPressed(Button::L1)) {
+            pdf_runtime.ZoomOut();
+          }
+          if (input.IsJustPressed(Button::R1)) {
+            pdf_runtime.ZoomIn();
+          }
+          if (input.IsJustPressed(Button::A)) {
+            pdf_runtime.ResetView();
+          }
+
+          std::array<Button, 4> dirs = {Button::Up, Button::Down, Button::Left, Button::Right};
+          for (Button b : dirs) {
+            int bi = static_cast<int>(b);
+            int long_dir = pdf_long_dir_for_button(b);
+            if (long_dir == 0) {
+              hold_speed[bi] = 0.0f;
+              continue;
+            }
+            if (input.IsPressed(b) && input.HoldTime(b) >= 0.28f) {
+              long_fired[bi] = true;
+              pdf_runtime.ScrollByPixels(long_dir * 20);
+            } else if (!input.IsPressed(b)) {
+              hold_speed[bi] = 0.0f;
+            }
+          }
+
+          for (Button b : dirs) {
+            int bi = static_cast<int>(b);
+            if (!input.IsJustReleased(b)) continue;
+            if (long_fired[bi]) {
+              long_fired[bi] = false;
+              continue;
+            }
+            const int tap_dir = pdf_long_dir_for_button(b);
+            if (tap_dir != 0) {
+              pdf_runtime.ScrollByPixels(tap_dir * 60);
+            } else {
+              const int page_action = pdf_tap_page_action_for_button(b);
+              if (page_action != 0) {
+                pdf_runtime.JumpByScreen(page_action);
+              }
+            }
+          }
         } else {
-          if (input.IsJustPressed(Button::L2)) { reader.rotation = (reader.rotation + 270) % 360; invalidate_render(); set_scroll_edge(true); }
-          if (input.IsJustPressed(Button::R2)) { reader.rotation = (reader.rotation + 90) % 360; invalidate_render(); set_scroll_edge(true); }
-          if (input.IsJustPressed(Button::L1)) { reader.zoom = std::max(0.25f, reader.zoom / 1.1f); invalidate_render(); clamp_scroll(); }
-          if (input.IsJustPressed(Button::R1)) { reader.zoom = std::min(6.0f, reader.zoom * 1.1f); invalidate_render(); clamp_scroll(); }
-          if (input.IsJustPressed(Button::A)) { reader.zoom = 1.0f; reader.scroll_x = reader.scroll_y = 0; invalidate_render(); clamp_scroll(); }
+          if (input.IsJustPressed(Button::L2) || input.IsJustPressed(Button::R2) ||
+              input.IsJustPressed(Button::L1) || input.IsJustPressed(Button::R1) ||
+              input.IsJustPressed(Button::A)) {
+            flush_pending_page_flip_now();
+          }
+          if (input.IsJustPressed(Button::L2)) {
+            ReaderViewState next_view = target_state;
+            next_view.rotation = (next_view.rotation + 270) % 360;
+            commit_target_view(next_view, true, true);
+          }
+          if (input.IsJustPressed(Button::R2)) {
+            ReaderViewState next_view = target_state;
+            next_view.rotation = (next_view.rotation + 90) % 360;
+            commit_target_view(next_view, true, true);
+          }
+          if (input.IsJustPressed(Button::L1)) {
+            ReaderViewState next_view = target_state;
+            next_view.zoom = std::max(0.25f, next_view.zoom / 1.1f);
+            commit_target_view(next_view, false, true);
+          }
+          if (input.IsJustPressed(Button::R1)) {
+            ReaderViewState next_view = target_state;
+            next_view.zoom = std::min(6.0f, next_view.zoom * 1.1f);
+            commit_target_view(next_view, false, true);
+          }
+          if (input.IsJustPressed(Button::A)) {
+            ReaderViewState next_view = target_state;
+            next_view.zoom = 1.0f;
+            commit_target_view(next_view, false, true);
+            reader.scroll_x = reader.scroll_y = 0;
+            clamp_scroll();
+          }
 
           std::array<Button, 4> dirs = {Button::Up, Button::Down, Button::Left, Button::Right};
           for (Button b : dirs) {
@@ -4927,11 +5675,12 @@ int main(int, char **) {
             }
             if (input.IsPressed(b)) {
               const float hold = input.HoldTime(b);
-              float delay = (reader.rotation == 0) ? 0.33f : 0.28f;
-              float speed_min = (reader.rotation == 0) ? 95.0f : 120.0f;
-              float speed_max = (reader.rotation == 0) ? 500.0f : 680.0f;
-              float speed_accel = (reader.rotation == 0) ? 620.0f : 920.0f;
+              float delay = (target_state.rotation == 0) ? 0.33f : 0.28f;
+              float speed_min = (target_state.rotation == 0) ? 95.0f : 120.0f;
+              float speed_max = (target_state.rotation == 0) ? 500.0f : 680.0f;
+              float speed_accel = (target_state.rotation == 0) ? 620.0f : 920.0f;
               if (hold >= delay) {
+                flush_pending_page_flip_now();
                 long_fired[bi] = true;
                 hold_speed[bi] = (hold_speed[bi] <= 0.0f) ? speed_min : std::min(speed_max, hold_speed[bi] + speed_accel * dt);
                 const int step_px = std::max(1, static_cast<int>(hold_speed[bi] * dt));
@@ -4954,15 +5703,23 @@ int main(int, char **) {
             }
             const int tap_dir = long_dir_for_button(b);
             if (tap_dir != 0) {
+              flush_pending_page_flip_now();
               scroll_by_dir(tap_dir, kReaderTapStepPx);
             } else {
               const int page_action = tap_page_action_for_button(b);
-              if (page_action > 0) go_next_page();
-              else if (page_action < 0) go_prev_page();
+              if (page_action > 0) {
+                queue_page_flip(1);
+              } else if (page_action < 0) {
+                queue_page_flip(-1);
+              }
             }
           }
         }
       }
+    }
+
+    if (state == State::Reader && reader_mode != ReaderMode::Txt && reader_mode != ReaderMode::Pdf) {
+      flush_pending_page_flip();
     }
 
     any_grid_animating = false;
@@ -5358,16 +6115,108 @@ int main(int, char **) {
           }
           SDL_RenderSetClipRect(renderer, nullptr);
 #endif
+        } else if (reader_mode == ReaderMode::Pdf && pdf_runtime.IsOpen()) {
+          pdf_runtime.UpdateViewport(Layout().screen_w, Layout().screen_h);
+          pdf_runtime.Tick();
+          pdf_runtime.Draw(renderer);
         } else {
           clamp_scroll();
-          if (ensure_render() && render_cache.texture) {
+          ensure_render();
+          const ReaderViewState draw_state =
+              display_state_valid ? display_state : target_state;
+          const ReaderPageRenderMode draw_mode = reader_page_render_mode_for_state(draw_state);
+          const float draw_scale =
+              (display_state_valid && render_cache.texture
+                   ? render_cache.scale
+                   : reader_target_scale_for_state(draw_state));
+          const bool showing_placeholder = (!display_state_valid || display_state != target_state);
+          bool drew_reader_content = false;
+          if (const ReaderRenderCache *cache =
+                  visible_reader_render_cache_for_page(draw_state.page, draw_state.rotation, draw_scale)) {
+            const bool cache_matches_display =
+                cache->page == draw_state.page &&
+                cache->rotation == draw_state.rotation &&
+                std::abs(cache->scale - draw_scale) < 0.0005f;
             int draw_x =
-                (render_cache.w <= Layout().screen_w) ? ((Layout().screen_w - render_cache.w) / 2) : -reader.scroll_x;
+                (cache->display_w <= Layout().screen_w)
+                    ? ((Layout().screen_w - cache->display_w) / 2)
+                    : (!showing_placeholder && cache_matches_display ? -reader.scroll_x : 0);
             int draw_y =
-                (render_cache.h <= Layout().screen_h) ? ((Layout().screen_h - render_cache.h) / 2) : -reader.scroll_y;
-            SDL_Rect dst{draw_x, draw_y, render_cache.w, render_cache.h};
-            SDL_RenderCopy(renderer, render_cache.texture, nullptr, &dst);
+                (cache->display_h <= Layout().screen_h)
+                    ? ((Layout().screen_h - cache->display_h) / 2)
+                    : (!showing_placeholder && cache_matches_display ? -reader.scroll_y : 0);
+            SDL_Rect dst{draw_x, draw_y, cache->display_w, cache->display_h};
+            SDL_RenderCopy(renderer, cache->texture, nullptr, &dst);
+            drew_reader_content = true;
+#ifdef HAVE_SDL2_TTF
+            if (showing_placeholder || !cache_matches_display) {
+              DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{0, 0, 0, 96});
+              if (!adaptive_render.pending_page_active) {
+                const int panel_w = std::min(Layout().screen_w - 40, 280);
+                const int panel_h = 64;
+                const int panel_x = (Layout().screen_w - panel_w) / 2;
+                const int panel_y = (Layout().screen_h - panel_h) / 2;
+                DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{16, 16, 18, 200});
+                DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{255, 255, 255, 40}, false);
+                SDL_Color text_color{244, 246, 250, 255};
+                if (TextCacheEntry *te = get_text_texture("Rendering...", text_color); te && te->texture) {
+                  SDL_Rect td{
+                      panel_x + std::max(0, (panel_w - te->w) / 2),
+                      panel_y + std::max(0, (panel_h - te->h) / 2),
+                      te->w,
+                      te->h,
+                  };
+                  SDL_RenderCopy(renderer, te->texture, nullptr, &td);
+                }
+              }
+            }
+#endif
           }
+#ifdef HAVE_SDL2_TTF
+          if (!drew_reader_content && !adaptive_render.pending_page_active) {
+            DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{0, 0, 0, 96});
+            const int panel_w = std::min(Layout().screen_w - 40, 280);
+            const int panel_h = 64;
+            const int panel_x = (Layout().screen_w - panel_w) / 2;
+            const int panel_y = (Layout().screen_h - panel_h) / 2;
+            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{16, 16, 18, 200});
+            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{255, 255, 255, 40}, false);
+            SDL_Color text_color{244, 246, 250, 255};
+            if (TextCacheEntry *te = get_text_texture("Rendering...", text_color); te && te->texture) {
+              SDL_Rect td{
+                  panel_x + std::max(0, (panel_w - te->w) / 2),
+                  panel_y + std::max(0, (panel_h - te->h) / 2),
+                  te->w,
+                  te->h,
+              };
+              SDL_RenderCopy(renderer, te->texture, nullptr, &td);
+            }
+          }
+#endif
+#ifdef HAVE_SDL2_TTF
+          if (adaptive_render.pending_page_active && adaptive_render.fast_flip_mode) {
+            DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, SDL_Color{0, 0, 0, 120});
+            const int panel_w = std::min(Layout().screen_w - 40, 320);
+            const int panel_h = 76;
+            const int panel_x = (Layout().screen_w - panel_w) / 2;
+            const int panel_y = (Layout().screen_h - panel_h) / 2;
+            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{16, 16, 18, 220});
+            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, SDL_Color{255, 255, 255, 48}, false);
+            const int pending_page = ClampInt(adaptive_render.pending_page, 0, std::max(0, reader_page_count() - 1));
+            const std::string fast_flip_text =
+                "Quick Jump: " + std::to_string(pending_page + 1) + " / " + std::to_string(std::max(1, reader_page_count()));
+            SDL_Color text_color{244, 246, 250, 255};
+            if (TextCacheEntry *te = get_text_texture(fast_flip_text, text_color); te && te->texture) {
+              SDL_Rect td{
+                  panel_x + std::max(0, (panel_w - te->w) / 2),
+                  panel_y + std::max(0, (panel_h - te->h) / 2),
+                  te->w,
+                  te->h,
+              };
+              SDL_RenderCopy(renderer, te->texture, nullptr, &td);
+            }
+          }
+#endif
         }
 #ifdef HAVE_SDL2_TTF
         if (reader_progress_overlay_visible) {
@@ -5379,7 +6228,11 @@ int main(int, char **) {
                       : 100;
           } else if (reader_is_open()) {
             const int page_count = std::max(1, reader_page_count());
-            const int page_idx = ClampInt(reader_current_page(), 0, page_count - 1);
+            const int page_idx = ClampInt(
+                (reader_mode == ReaderMode::Pdf)
+                    ? pdf_runtime.Progress().page
+                    : target_state.page,
+                0, page_count - 1);
             pct = (page_count <= 1) ? 100 : ClampInt(static_cast<int>((static_cast<int64_t>(page_idx) * 100) / (page_count - 1)), 0, 100);
           }
           const int panel_h = 58;
@@ -5590,8 +6443,12 @@ int main(int, char **) {
   }
 
   if (!current_book.empty()) {
-    if (reader_mode == ReaderMode::Pdf && pdf.IsOpen()) {
-      reader.page = pdf.CurrentPage();
+    if (reader_mode == ReaderMode::Pdf && pdf_runtime.IsOpen()) {
+      const PdfRuntimeProgress active_pdf = pdf_runtime.Progress();
+      reader.page = active_pdf.page;
+      reader.scroll_y = active_pdf.scroll_y;
+      reader.zoom = active_pdf.zoom;
+      reader.rotation = active_pdf.rotation;
     } else if (reader_mode == ReaderMode::Epub && epub_comic.IsOpen()) {
       reader.page = epub_comic.CurrentPage();
     } else if (reader_mode == ReaderMode::Txt && txt_reader.open) {
@@ -5605,7 +6462,6 @@ int main(int, char **) {
     }
     if (!current_book.empty()) {
       ReaderProgress save_reader = reader;
-      if (reader_mode == ReaderMode::Pdf) save_reader.rotation = 0;
       progress.Set(current_book, save_reader);
       history_store.Add(current_book);
     }
@@ -5649,10 +6505,24 @@ int main(int, char **) {
 #endif
   invalidate_all_render_cache();
   destroy_shelf_render_cache();
-  pdf.Close();
+  for (auto &slot : reader_texture_pool) {
+    if (slot.texture) {
+      forget_texture_size(slot.texture);
+      SDL_DestroyTexture(slot.texture);
+      slot = ReaderTexturePoolEntry{};
+    }
+  }
+  SDL_LockMutex(reader_async_mutex);
+  reader_async_worker_running = false;
+  SDL_CondSignal(reader_async_cond);
+  SDL_UnlockMutex(reader_async_mutex);
+  if (reader_async_thread) SDL_WaitThread(reader_async_thread, nullptr);
+  reset_reader_async_state();
+  if (reader_async_cond) SDL_DestroyCond(reader_async_cond);
+  if (reader_async_mutex) SDL_DestroyMutex(reader_async_mutex);
+  pdf_runtime.Close();
   epub_comic.Close();
-  pdf_page_size_cache.clear();
-  pdf_render_scale_caps.clear();
+  reader_page_size_cache.clear();
   for (SDL_GameController *gc : opened_controllers) {
     if (gc) SDL_GameControllerClose(gc);
   }

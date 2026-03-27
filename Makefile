@@ -1,9 +1,10 @@
 CXX ?= g++
 PKG_CONFIG ?= pkg-config
 REQUIRE_MUPDF ?= 0
+H700_OPTIMIZE ?= 0
 
 TARGET := build/rocreader_sdl
-SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/animation.cpp
+SRCS := src/main.cpp src/book_scanner.cpp src/storage_paths.cpp src/pdf_reader.cpp src/pdf_runtime.cpp src/epub_reader.cpp src/epub_comic_reader.cpp src/cover_resolver.cpp src/animation.cpp
 OBJS := $(SRCS:.cpp=.o)
 
 SDL_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
@@ -14,6 +15,10 @@ SDL_LIBS := -lSDL2
 endif
 
 CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra -Wno-unused-parameter
+ifeq ($(H700_OPTIMIZE),1)
+CXXFLAGS := $(filter-out -O0 -O1 -O2 -O3 -Ofast,$(CXXFLAGS))
+CXXFLAGS += -O3 -mcpu=cortex-a53 -mtune=cortex-a53 -ffast-math
+endif
 CXXFLAGS += $(SDL_CFLAGS) -I./src
 LDFLAGS += $(SDL_LIBS)
 CXXFLAGS += $(EXTRA_CXXFLAGS)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -19,8 +20,10 @@ public:
 
   bool PageSize(int page_index, int &w, int &h);
   bool CurrentPageSize(int &w, int &h);
-  bool RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h);
-  bool RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h);
+  bool RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h,
+                      const std::atomic<bool> *cancel = nullptr);
+  bool RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h,
+                             const std::atomic<bool> *cancel = nullptr);
 
 private:
 #ifdef HAVE_LIBZIP

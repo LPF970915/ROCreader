@@ -339,14 +339,17 @@ bool EpubComicReader::PageSize(int page_index, int &w, int &h) {
 
 bool EpubComicReader::CurrentPageSize(int &w, int &h) { return PageSize(CurrentPage(), w, h); }
 
-bool EpubComicReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h) {
+bool EpubComicReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h,
+                                     const std::atomic<bool> *cancel) {
   if (!IsOpen()) return false;
   page_index = std::clamp(page_index, 0, PageCount() - 1);
   scale = std::max(0.1f, scale);
+  if (cancel && cancel->load()) return false;
 #ifdef HAVE_LIBZIP
   PageEntry &entry = impl_->pages[page_index];
   std::vector<unsigned char> bytes;
   if (!ReadZipEntry(impl_->zip, entry.image_entry, bytes)) return false;
+  if (cancel && cancel->load()) return false;
   SDL_Surface *surface = LoadSurfaceFromMemory(bytes.data(), bytes.size());
   if (!surface) return false;
 
@@ -363,6 +366,10 @@ bool EpubComicReader::RenderPageRGBA(int page_index, float scale, std::vector<un
 
   SDL_Surface *scaled = rgba_surface;
   if (w != rgba_surface->w || h != rgba_surface->h) {
+    if (cancel && cancel->load()) {
+      SDL_FreeSurface(rgba_surface);
+      return false;
+    }
     scaled = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_RGBA32);
     if (!scaled) {
       SDL_FreeSurface(rgba_surface);
@@ -378,6 +385,11 @@ bool EpubComicReader::RenderPageRGBA(int page_index, float scale, std::vector<un
 
   rgba.assign(static_cast<size_t>(w * h * 4), 0);
   for (int y = 0; y < h; ++y) {
+    if (cancel && cancel->load()) {
+      SDL_FreeSurface(scaled);
+      rgba.clear();
+      return false;
+    }
     const unsigned char *src_row = static_cast<const unsigned char *>(scaled->pixels) + y * scaled->pitch;
     unsigned char *dst_row = rgba.data() + static_cast<size_t>(y * w * 4);
     std::memcpy(dst_row, src_row, static_cast<size_t>(w * 4));
@@ -392,6 +404,7 @@ bool EpubComicReader::RenderPageRGBA(int page_index, float scale, std::vector<un
 #endif
 }
 
-bool EpubComicReader::RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h) {
-  return RenderPageRGBA(CurrentPage(), scale, rgba, w, h);
+bool EpubComicReader::RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h,
+                                            const std::atomic<bool> *cancel) {
+  return RenderPageRGBA(CurrentPage(), scale, rgba, w, h, cancel);
 }
