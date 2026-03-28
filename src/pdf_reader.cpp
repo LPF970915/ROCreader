@@ -332,8 +332,8 @@ bool PdfReader::RenderPageRegionRGBA(int page_index, float scale, int src_x, int
   renderer.set_render_hint(poppler::page_renderer::antialiasing, true);
   const double dpi = 72.0 * static_cast<double>(scale);
   if (cancel && cancel->load()) return false;
-  // The strip scheduler computes crop rectangles in scaled output pixels. poppler-cpp expects
-  // the crop rectangle in the page's original coordinate space, so convert it back first.
+  // poppler-cpp expects the crop rectangle in the page's original coordinate space,
+  // so convert any scaled output-space crop rectangle back first.
   const double inv_scale = 1.0 / static_cast<double>(scale);
   const int crop_x = std::max(0, static_cast<int>(std::floor(static_cast<double>(src_x) * inv_scale)));
   const int crop_y = std::max(0, static_cast<int>(std::floor(static_cast<double>(src_y) * inv_scale)));

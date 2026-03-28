@@ -22,6 +22,7 @@ public:
 
   bool IsOpen() const;
   bool HasRealRenderer() const;
+  bool IsRenderPending() const;
 
   void UpdateViewport(int screen_w, int screen_h);
   void Tick();

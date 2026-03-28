@@ -43,7 +43,6 @@
 #include "book_scanner.h"
 #include "boot_runtime.h"
 #include "cover_service.h"
-#include "epub_comic_reader.h"
 #include "epub_runtime.h"
 #include "epub_reader.h"
 #include "input_manager.h"
@@ -51,9 +50,6 @@
 #include "pdf_runtime.h"
 #include "progress_store.h"
 #include "reader_core.h"
-#include "reader_render_controller.h"
-#include "reader_render_runtime.h"
-#include "reader_runtime_common.h"
 #include "reader_session_ops.h"
 #include "reader_session_state.h"
 #include "shelf_runtime.h"
@@ -788,20 +784,9 @@ int main(int, char **) {
     if ((force || history_store.ShouldFlush(tick_now, kDeferredSaveDelayMs)) && history_store.IsDirty()) history_store.Save();
   };
   PdfRuntime pdf_runtime;
-  EpubComicReader epub_comic;
-  std::cout << "[native_h700] epub comic backend: " << epub_comic.BackendName()
-            << " (real_renderer=" << (epub_comic.HasRealRenderer() ? "yes" : "no") << ")\n";
-  ReaderRenderState reader_render;
-  ReaderRenderCache &render_cache = reader_render.render_cache;
-  ReaderRenderCache &secondary_render_cache = reader_render.secondary_render_cache;
-  ReaderRenderCache &tertiary_render_cache = reader_render.tertiary_render_cache;
-  ReaderViewState &display_state = reader_render.display_state;
-  ReaderViewState &target_state = reader_render.target_state;
-  ReaderViewState &ready_state = reader_render.ready_state;
-  bool &display_state_valid = reader_render.display_state_valid;
-  bool &ready_state_valid = reader_render.ready_state_valid;
-  ReaderAdaptiveRenderState &adaptive_render = reader_render.adaptive_render;
-  ReaderAsyncState reader_async;
+  EpubRuntime epub_runtime;
+  std::cout << "[native_h700] epub comic backend: " << epub_runtime.BackendName()
+            << " (real_renderer=" << (epub_runtime.HasRealRenderer() ? "yes" : "no") << ")\n";
   ShelfRenderCache shelf_render_cache;
   ShelfRuntimeState shelf_runtime;
   uint64_t &shelf_content_version = shelf_runtime.content_version;
@@ -846,15 +831,11 @@ int main(int, char **) {
   ReaderProgress &reader = reader_ui.progress;
   ReaderMode &reader_mode = reader_ui.mode;
   TxtReaderState &txt_reader = reader_ui.txt_reader;
-  ReaderBackendState reader_backend{reader_mode, pdf_runtime, epub_comic};
-  InitReaderAsyncState(reader_async);
   bool &reader_progress_overlay_visible = reader_ui.progress_overlay_visible;
   float &hold_cooldown = reader_ui.hold_cooldown;
   auto &hold_speed = reader_ui.hold_speed;
   auto &long_fired = reader_ui.long_fired;
   int nav_selected_index = 0; // 0: ALL COMICS, 1: ALL BOOKS, 2: COLLECTIONS, 3: HISTORY
-  bool &warned_mock_pdf_backend = reader_ui.warned_mock_pdf_backend;
-  bool &warned_epub_backend = reader_ui.warned_epub_backend;
 
   auto current_category = [&]() -> ShelfCategory {
     return ClampShelfCategory(nav_selected_index);
@@ -1135,15 +1116,6 @@ int main(int, char **) {
     }
   };
 
-  auto destroy_render_cache = [&](ReaderRenderCache &cache) {
-    DestroyReaderRenderCache(reader_render, cache, forget_texture_size);
-  };
-
-  auto acquire_reader_texture = [&](int w, int h) -> SDL_Texture * {
-    return AcquireReaderTexture(reader_render, renderer, w, h, remember_texture_size,
-                                forget_texture_size);
-  };
-
   auto destroy_shelf_render_cache = [&]() {
     DestroyShelfRenderCache(shelf_render_cache, forget_texture_size);
   };
@@ -1152,163 +1124,7 @@ int main(int, char **) {
     InvalidateShelfRenderCache(shelf_render_cache, forget_texture_size);
   };
 
-  auto invalidate_all_render_cache = [&]() {
-    InvalidateAllReaderRenderCaches(reader_render, forget_texture_size);
-  };
-
-  auto reader_is_open = [&]() -> bool {
-    return ReaderIsOpen(reader_backend);
-  };
-
-  auto reader_page_count = [&]() -> int {
-    return ReaderPageCount(reader_backend);
-  };
-
-  auto reader_current_page = [&]() -> int {
-    return ReaderCurrentPage(reader_backend);
-  };
-
-  auto reader_set_page = [&](int page_index) {
-    ReaderSetPage(reader_backend, page_index);
-  };
-
-  auto reader_page_size = [&](int page_index, int &w, int &h) -> bool {
-    return ReaderPageSize(reader_backend, page_index, w, h);
-  };
-
-  auto reset_reader_async_state = [&]() {
-    ResetReaderAsyncState(reader_async);
-    ready_state_valid = false;
-  };
-
-  std::function<float(const ReaderViewState &)> reader_target_scale_for_state;
-  ReaderRenderRuntimeDeps *reader_render_runtime_deps_ptr = nullptr;
-  auto promote_async_render_result = [&]() {
-    return reader_render_runtime_deps_ptr ?
-               PromoteAsyncReaderRenderResult(*reader_render_runtime_deps_ptr) :
-               false;
-  };
-
-  auto request_reader_async_render = [&](int page, float target_scale, int display_w, int display_h, bool prefetch) {
-    return reader_render_runtime_deps_ptr ?
-               RequestAsyncReaderRender(*reader_render_runtime_deps_ptr, page, target_scale, display_w, display_h,
-                                        prefetch) :
-               false;
-  };
-
-  auto reader_page_size_cached = [&](int page_index, int &w, int &h) -> bool {
-    return ReaderPageSizeCached(reader_backend, reader_render, page_index, w, h);
-  };
-
-  ReaderRenderControllerDeps reader_controller_deps{
-      Layout().screen_w,
-      Layout().screen_h,
-      reader,
-      hold_cooldown,
-      reader_render,
-      reader_async,
-      reader_is_open,
-      reader_page_count,
-      reader_set_page,
-      reader_page_size_cached,
-      destroy_render_cache,
-      promote_async_render_result,
-      request_reader_async_render,
-  };
-
-  auto visible_reader_render_cache = [&]() -> const ReaderRenderCache * {
-    return VisibleReaderRenderCache(reader_controller_deps);
-  };
-
-  auto matching_reader_render_cache = [&](int page, int rotation, float target_scale, ReaderRenderQuality quality)
-      -> ReaderRenderCache * {
-    return MatchingReaderRenderCache(reader_controller_deps, page, rotation, target_scale, quality);
-  };
-
-  auto visible_reader_render_cache_for_page = [&](int page, int rotation, float target_scale) -> const ReaderRenderCache * {
-    return VisibleReaderRenderCacheForPage(reader_controller_deps, page, rotation, target_scale);
-  };
-
-  auto neighbor_cache_slot_for_page = [&](int page) -> ReaderRenderCache * {
-    return (page < target_state.page) ? &secondary_render_cache : &tertiary_render_cache;
-  };
-
-  auto effective_display_size = [&](int page, int rotation, float target_scale, int &out_w, int &out_h) -> bool {
-    return EffectiveReaderDisplaySize(reader_controller_deps, page, rotation, target_scale, out_w, out_h);
-  };
-
-  reader_target_scale_for_state = [&](const ReaderViewState &state) -> float {
-    return ReaderTargetScaleForState(reader_controller_deps, state);
-  };
-  ReaderRenderRuntimeDeps reader_render_runtime_deps{
-      reader_mode,
-      current_book,
-      reader_render,
-      reader_async,
-      display_state,
-      target_state,
-      ready_state,
-      display_state_valid,
-      ready_state_valid,
-      reader_is_open,
-      reader_target_scale_for_state,
-      acquire_reader_texture,
-      destroy_render_cache,
-  };
-  reader_render_runtime_deps_ptr = &reader_render_runtime_deps;
-
-  auto effective_display_size_for_state = [&](const ReaderViewState &state, int &out_w, int &out_h) -> bool {
-    return EffectiveReaderDisplaySizeForState(reader_controller_deps, state, out_w, out_h);
-  };
-
-  auto prune_reader_neighbor_caches = [&](int center_page, int rotation, float target_scale) {
-    PruneReaderNeighborCaches(reader_controller_deps, center_page, rotation, target_scale);
-  };
-
-  auto current_reader_axis_sign = [&]() {
-    return CurrentReaderAxisSign(reader_controller_deps);
-  };
-
-  auto current_reader_display_size = [&](int &out_w, int &out_h) -> bool {
-    return CurrentReaderDisplaySize(reader_controller_deps, out_w, out_h);
-  };
-
-  auto promote_ready_target_to_display = [&](float target_scale, ReaderRenderQuality quality) -> bool {
-    return PromoteReadyTargetToDisplay(reader_controller_deps, target_scale, quality);
-  };
-
-  auto ensure_render = [&]() {
-    return EnsureReaderRender(reader_controller_deps);
-  };
-
-  auto clamp_scroll = [&]() {
-    ClampReaderScroll(reader_controller_deps);
-  };
-
-  auto set_scroll_edge = [&](bool top) {
-    SetReaderScrollEdge(reader_controller_deps, top);
-  };
-
-  auto commit_target_view = [&](ReaderViewState next_state, bool align_to_edge, bool edge_top) {
-    CommitReaderTargetView(reader_controller_deps, next_state, align_to_edge, edge_top);
-  };
-
-  auto queue_page_flip = [&](int page_action) {
-    QueueReaderPageFlip(reader_controller_deps, page_action, kReaderFastFlipThresholdMs,
-                        kReaderPageFlipDebounceMs);
-  };
-
-  auto flush_pending_page_flip = [&]() {
-    FlushPendingReaderPageFlip(reader_controller_deps);
-  };
-
-  auto flush_pending_page_flip_now = [&]() {
-    FlushPendingReaderPageFlipNow(reader_controller_deps);
-  };
-
-  auto scroll_by_dir = [&](int dir, int step_px) {
-    ScrollReaderByDir(reader_controller_deps, dir, step_px);
-  };
+  auto invalidate_all_render_cache = [&]() {};
 
   auto close_text_reader = [&]() {
     txt_reader = TxtReaderState{};
@@ -1432,7 +1248,9 @@ int main(int, char **) {
         txt_transcode_job.active ||
         (reader_mode == ReaderMode::Txt && txt_reader.open && txt_reader.loading) ||
         (animate_enabled && (menu_anim.IsAnimating() || scene_flash.IsAnimating() || page_animating || any_grid_animating));
-    const bool needs_periodic_tick = (state == State::Shelf && title_marquee_active);
+    const bool needs_periodic_tick =
+        (state == State::Shelf && title_marquee_active) ||
+        (state == State::Reader && reader_mode == ReaderMode::Pdf && pdf_runtime.IsRenderPending());
     const uint32_t loop_now = SDL_GetTicks();
     const bool has_pending_flush =
         config.ShouldFlush(loop_now, kDeferredSaveDelayMs) ||
@@ -1603,20 +1421,9 @@ int main(int, char **) {
                 Layout().screen_h,
                 reader_ui,
                 pdf_runtime,
-                epub_comic,
-                adaptive_render,
-                display_state,
-                ready_state,
-                target_state,
-                display_state_valid,
-                ready_state_valid,
+                epub_runtime,
                 open_text_book,
                 close_text_reader,
-                reset_reader_async_state,
-                invalidate_all_render_cache,
-                [&]() { ClearReaderPageSizeCache(reader_render); },
-                clamp_scroll,
-                reader_current_page,
             };
             const bool opened = OpenReaderSession(item.path, ext, open_deps);
             if (opened) {
@@ -1662,21 +1469,13 @@ int main(int, char **) {
       HandleSettingsInput(settings_input_deps);
     } else if (state == State::Reader) {
       if (input.IsJustPressed(Button::B)) {
-        if (reader_mode != ReaderMode::Txt) flush_pending_page_flip_now();
+        if (reader_mode == ReaderMode::Epub) epub_runtime.CommitPendingNavigation();
         ReaderCloseDeps close_deps{
             reader_ui,
             progress,
             pdf_runtime,
-            epub_comic,
-            display_state,
-            ready_state,
-            target_state,
-            display_state_valid,
-            ready_state_valid,
+            epub_runtime,
             close_text_reader,
-            reset_reader_async_state,
-            invalidate_all_render_cache,
-            [&]() { ClearReaderPageSizeCache(reader_render); },
             persist_current_txt_resume_snapshot,
         };
         CloseReaderSession(close_deps);
@@ -1749,25 +1548,13 @@ int main(int, char **) {
             }
           }
         } else {
-          EpubReaderInputDeps epub_input_deps{
-              input,
-              reader_ui,
-              target_state,
-              dt,
-              kReaderTapStepPx,
-              flush_pending_page_flip_now,
-              commit_target_view,
-              scroll_by_dir,
-              queue_page_flip,
-              clamp_scroll,
-          };
-          HandleEpubReaderInput(epub_input_deps);
+          epub_runtime.HandleInput(input, dt, kReaderTapStepPx);
         }
       }
     }
 
     if (state == State::Reader && reader_mode != ReaderMode::Txt && reader_mode != ReaderMode::Pdf) {
-      flush_pending_page_flip();
+      epub_runtime.Tick();
     }
 
     any_grid_animating = false;
@@ -1937,7 +1724,7 @@ int main(int, char **) {
           pdf_runtime.Tick();
           pdf_runtime.Draw(renderer);
         } else {
-          clamp_scroll();
+          epub_runtime.UpdateViewport(Layout().screen_w, Layout().screen_h);
           auto draw_centered_reader_label = [&](const std::string &text, int panel_w, int panel_h, SDL_Color panel_color, SDL_Color border_color) {
             const int panel_x = (Layout().screen_w - panel_w) / 2;
             const int panel_y = (Layout().screen_h - panel_h) / 2;
@@ -1958,20 +1745,8 @@ int main(int, char **) {
             (void)text;
 #endif
           };
-          EpubRuntimeRenderDeps epub_render_deps{
+          epub_runtime.Draw(
               renderer,
-              Layout().screen_w,
-              Layout().screen_h,
-              reader_ui,
-              adaptive_render,
-              render_cache,
-              display_state,
-              target_state,
-              display_state_valid,
-              ensure_render,
-              reader_target_scale_for_state,
-              visible_reader_render_cache_for_page,
-              reader_page_count,
               [&](const std::string &text) {
                 draw_centered_reader_label(text, std::min(Layout().screen_w - 40, 280), 64,
                                            SDL_Color{16, 16, 18, 200}, SDL_Color{255, 255, 255, 40});
@@ -1979,21 +1754,23 @@ int main(int, char **) {
               [&](const std::string &text) {
                 draw_centered_reader_label(text, std::min(Layout().screen_w - 40, 320), 76,
                                            SDL_Color{16, 16, 18, 220}, SDL_Color{255, 255, 255, 48});
-              },
-          };
-          DrawEpubRuntime(epub_render_deps);
+              });
         }
 #ifdef HAVE_SDL2_TTF
         if (reader_progress_overlay_visible) {
           int pct = 0;
           if (reader_mode == ReaderMode::Txt && txt_reader.open) {
             pct = TxtReaderProgressPercent(txt_reader);
-          } else if (reader_is_open()) {
-            const int page_count = std::max(1, reader_page_count());
+          } else if (reader_mode == ReaderMode::Pdf && pdf_runtime.IsOpen()) {
+            const int page_count = std::max(1, pdf_runtime.PageCount());
             const int page_idx = ClampInt(
-                (reader_mode == ReaderMode::Pdf)
-                    ? pdf_runtime.Progress().page
-                    : target_state.page,
+                pdf_runtime.Progress().page,
+                0, page_count - 1);
+            pct = (page_count <= 1) ? 100 : ClampInt(static_cast<int>((static_cast<int64_t>(page_idx) * 100) / (page_count - 1)), 0, 100);
+          } else if (reader_mode == ReaderMode::Epub && epub_runtime.IsOpen()) {
+            const int page_count = std::max(1, epub_runtime.PageCount());
+            const int page_idx = ClampInt(
+                epub_runtime.Progress().page,
                 0, page_count - 1);
             pct = (page_count <= 1) ? 100 : ClampInt(static_cast<int>((static_cast<int64_t>(page_idx) * 100) / (page_count - 1)), 0, 100);
           }
@@ -2083,8 +1860,14 @@ int main(int, char **) {
       reader.scroll_y = active_pdf.scroll_y;
       reader.zoom = active_pdf.zoom;
       reader.rotation = active_pdf.rotation;
-    } else if (reader_mode == ReaderMode::Epub && epub_comic.IsOpen()) {
-      reader.page = epub_comic.CurrentPage();
+    } else if (reader_mode == ReaderMode::Epub && epub_runtime.IsOpen()) {
+      epub_runtime.CommitPendingNavigation();
+      const EpubRuntimeProgress active_epub = epub_runtime.Progress();
+      reader.page = active_epub.page;
+      reader.scroll_x = active_epub.scroll_x;
+      reader.scroll_y = active_epub.scroll_y;
+      reader.zoom = active_epub.zoom;
+      reader.rotation = active_epub.rotation;
     } else if (reader_mode == ReaderMode::Txt && txt_reader.open) {
       reader.page = (txt_reader.line_h > 0) ? (txt_reader.scroll_px / txt_reader.line_h) : 0;
       reader.scroll_y = txt_reader.scroll_px;
@@ -2106,13 +1889,9 @@ int main(int, char **) {
 #ifdef HAVE_SDL2_TTF
   ShutdownUiTextCache(ui_text_cache, forget_texture_size);
 #endif
-  invalidate_all_render_cache();
   destroy_shelf_render_cache();
-  DestroyReaderTexturePool(reader_render, forget_texture_size);
-  ShutdownReaderAsyncState(reader_async);
   pdf_runtime.Close();
-  epub_comic.Close();
-  ClearReaderPageSizeCache(reader_render);
+  epub_runtime.Close();
   for (SDL_GameController *gc : opened_controllers) {
     if (gc) SDL_GameControllerClose(gc);
   }

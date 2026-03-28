@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <utility>
 
 ProgressStore::ProgressStore(std::string path) : path_(std::move(path)) { Load(); }
@@ -57,11 +58,34 @@ void ProgressStore::Load() {
   std::string line;
   while (std::getline(in, line)) {
     if (line.empty()) continue;
-    std::istringstream iss(line);
     ReaderProgress rp;
-    std::string book;
-    if (!(iss >> book >> rp.page >> rp.rotation >> rp.zoom >> rp.scroll_x >> rp.scroll_y)) continue;
-    map_[book] = rp;
+    std::string_view row(line);
+    size_t field_end = row.size();
+    std::string fields[6];
+    bool ok = true;
+    for (int i = 5; i >= 1; --i) {
+      const size_t tab = row.rfind('\t', field_end == row.size() ? std::string_view::npos : field_end - 1);
+      if (tab == std::string_view::npos) {
+        ok = false;
+        break;
+      }
+      fields[i] = std::string(row.substr(tab + 1, field_end - tab - 1));
+      field_end = tab;
+    }
+    if (!ok) continue;
+    fields[0] = std::string(row.substr(0, field_end));
+    if (fields[0].empty()) continue;
+
+    try {
+      rp.page = std::stoi(fields[1]);
+      rp.rotation = std::stoi(fields[2]);
+      rp.zoom = std::stof(fields[3]);
+      rp.scroll_x = std::stoi(fields[4]);
+      rp.scroll_y = std::stoi(fields[5]);
+    } catch (...) {
+      continue;
+    }
+    map_[fields[0]] = rp;
   }
   dirty_ = false;
   last_dirty_tick_ = 0;
