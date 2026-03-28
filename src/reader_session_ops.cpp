@@ -16,6 +16,7 @@ bool OpenReaderSession(const std::string &book_path, const std::string &ext, Rea
     pdf_progress.scroll_y = deps.ui.progress.scroll_y;
     if (deps.pdf_runtime.Open(deps.renderer, book_path, deps.screen_w, deps.screen_h, pdf_progress)) {
       deps.close_text_reader();
+      deps.epub_runtime.Close();
       deps.ui.mode = ReaderMode::Pdf;
       opened = true;
     }
@@ -31,7 +32,6 @@ bool OpenReaderSession(const std::string &book_path, const std::string &ext, Rea
     epub_progress.page = deps.ui.progress.page;
     epub_progress.rotation = deps.ui.progress.rotation;
     epub_progress.zoom = deps.ui.progress.zoom;
-    epub_progress.scroll_x = deps.ui.progress.scroll_x;
     epub_progress.scroll_y = deps.ui.progress.scroll_y;
     if (deps.epub_runtime.Open(deps.renderer, book_path, deps.screen_w, deps.screen_h, epub_progress)) {
       deps.close_text_reader();
@@ -75,7 +75,7 @@ void CloseReaderSession(ReaderCloseDeps &deps) {
   } else if (deps.ui.mode == ReaderMode::Epub && deps.epub_runtime.IsOpen()) {
     const EpubRuntimeProgress active_epub = deps.epub_runtime.Progress();
     deps.ui.progress.page = active_epub.page;
-    deps.ui.progress.scroll_x = active_epub.scroll_x;
+    deps.ui.progress.scroll_x = 0;
     deps.ui.progress.scroll_y = active_epub.scroll_y;
     deps.ui.progress.zoom = active_epub.zoom;
     deps.ui.progress.rotation = active_epub.rotation;

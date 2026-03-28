@@ -18,8 +18,8 @@ public:
   void NextPage();
   void PrevPage();
 
-  bool PageSize(int page_index, int &w, int &h);
-  bool CurrentPageSize(int &w, int &h);
+  bool PageSize(int page_index, int &w, int &h) const;
+  bool CurrentPageSize(int &w, int &h) const;
   bool RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h,
                       const std::atomic<bool> *cancel = nullptr);
   bool RenderCurrentPageRGBA(float scale, std::vector<unsigned char> &rgba, int &w, int &h,

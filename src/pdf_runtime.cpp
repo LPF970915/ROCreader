@@ -20,6 +20,8 @@ constexpr float kZoomStep = 0.1f;
 constexpr size_t kTextureCacheSize = 3;
 constexpr Uint32 kVisualRenderThrottleMs = 75;
 constexpr Uint32 kIdlePrefetchDelayMs = 220;
+constexpr int kDefaultMaxTextureDim = 4096;
+constexpr int64_t kSafeTexturePixelBudget = 5600000;
 
 struct ViewState {
   float zoom = 1.0f;
@@ -141,6 +143,8 @@ struct PdfRuntime::Impl {
   std::string path;
   int screen_w = 720;
   int screen_h = 480;
+  int max_texture_w = kDefaultMaxTextureDim;
+  int max_texture_h = kDefaultMaxTextureDim;
 
   PdfState target_state;
   PdfState display_state;
@@ -241,14 +245,12 @@ struct PdfRuntime::Impl {
     return changed;
   }
 
-  float RenderScaleForState(const PdfState &state) const {
-    int page_w = 0;
-    int page_h = 0;
-    if (!reader.PageSize(state.location.page_num, page_w, page_h) || page_w <= 0 || page_h <= 0) {
-      return std::max(kMinZoom, std::min(kMaxZoom, state.view.zoom));
+  float SafeRenderScaleForPageMetrics(int page_w, int page_h, const ViewState &view) const {
+    if (page_w <= 0 || page_h <= 0) {
+      return std::max(kMinZoom, std::min(kMaxZoom, view.zoom));
     }
 
-    const int rotation = NormalizeRotation(state.view.rotation);
+    const int rotation = NormalizeRotation(view.rotation);
     float fit_scale = 1.0f;
     if (rotation == 90 || rotation == 270) {
       fit_scale = std::max(0.1f, static_cast<float>(screen_h) /
@@ -257,7 +259,42 @@ struct PdfRuntime::Impl {
       fit_scale = std::max(0.1f, static_cast<float>(screen_w) /
                                     static_cast<float>(std::max(1, page_w)));
     }
-    return std::max(kMinZoom, std::min(kMaxZoom, fit_scale * state.view.zoom));
+    const float ideal_scale = std::max(kMinZoom, std::min(kMaxZoom, fit_scale * view.zoom));
+    const int64_t ideal_raw_w =
+        std::max<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(page_w) * ideal_scale)));
+    const int64_t ideal_raw_h =
+        std::max<int64_t>(1, static_cast<int64_t>(std::llround(static_cast<double>(page_h) * ideal_scale)));
+    const int64_t ideal_final_w = (rotation == 90 || rotation == 270) ? ideal_raw_h : ideal_raw_w;
+    const int64_t ideal_final_h = (rotation == 90 || rotation == 270) ? ideal_raw_w : ideal_raw_h;
+
+    float safe_scale = ideal_scale;
+
+    if (max_texture_w > 0 && ideal_final_w > max_texture_w) {
+      safe_scale = std::min(safe_scale,
+                            ideal_scale * static_cast<float>(max_texture_w) / static_cast<float>(ideal_final_w));
+    }
+    if (max_texture_h > 0 && ideal_final_h > max_texture_h) {
+      safe_scale = std::min(safe_scale,
+                            ideal_scale * static_cast<float>(max_texture_h) / static_cast<float>(ideal_final_h));
+    }
+
+    const int64_t total_pixels = ideal_final_w * ideal_final_h;
+    if (total_pixels > kSafeTexturePixelBudget && total_pixels > 0) {
+      const double ratio =
+          std::sqrt(static_cast<double>(kSafeTexturePixelBudget) / static_cast<double>(total_pixels));
+      safe_scale = std::min(safe_scale, ideal_scale * static_cast<float>(ratio));
+    }
+
+    return std::max(kMinZoom, std::min(kMaxZoom, safe_scale));
+  }
+
+  float RenderScaleForState(const PdfState &state) const {
+    int page_w = 0;
+    int page_h = 0;
+    if (!reader.PageSize(state.location.page_num, page_w, page_h) || page_w <= 0 || page_h <= 0) {
+      return std::max(kMinZoom, std::min(kMaxZoom, state.view.zoom));
+    }
+    return SafeRenderScaleForPageMetrics(page_w, page_h, state.view);
   }
 
   int RenderedFlowExtent(const PdfState &state) const {
@@ -609,17 +646,7 @@ struct PdfRuntime::Impl {
         page_w = 720;
         page_h = 480;
       }
-      const int rotation = NormalizeRotation(task_state.view.rotation);
-      float fit_scale = 1.0f;
-      if (rotation == 90 || rotation == 270) {
-        fit_scale = std::max(0.1f, static_cast<float>(impl->screen_h) /
-                                      static_cast<float>(std::max(1, page_w)));
-      } else {
-        fit_scale = std::max(0.1f, static_cast<float>(impl->screen_w) /
-                                      static_cast<float>(std::max(1, page_w)));
-      }
-      const float render_scale =
-          std::max(kMinZoom, std::min(kMaxZoom, fit_scale * task_state.view.zoom));
+      const float render_scale = impl->SafeRenderScaleForPageMetrics(page_w, page_h, task_state.view);
 
       std::vector<unsigned char> rgba;
       int raw_w = 0;
@@ -746,6 +773,15 @@ bool PdfRuntime::Open(SDL_Renderer *renderer,
   impl_->renderer = renderer;
   impl_->screen_w = std::max(1, screen_w);
   impl_->screen_h = std::max(1, screen_h);
+  SDL_RendererInfo renderer_info{};
+  if (renderer && SDL_GetRendererInfo(renderer, &renderer_info) == 0) {
+    if (renderer_info.max_texture_width > 0) {
+      impl_->max_texture_w = renderer_info.max_texture_width;
+    }
+    if (renderer_info.max_texture_height > 0) {
+      impl_->max_texture_h = renderer_info.max_texture_height;
+    }
+  }
 
   if (!impl_->reader.Open(path)) return false;
   impl_->path = path;

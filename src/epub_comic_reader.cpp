@@ -307,11 +307,11 @@ void EpubComicReader::SetPage(int page_index) {
 void EpubComicReader::NextPage() { SetPage(CurrentPage() + 1); }
 void EpubComicReader::PrevPage() { SetPage(CurrentPage() - 1); }
 
-bool EpubComicReader::PageSize(int page_index, int &w, int &h) {
+bool EpubComicReader::PageSize(int page_index, int &w, int &h) const {
   if (!IsOpen()) return false;
   page_index = std::clamp(page_index, 0, PageCount() - 1);
 #ifdef HAVE_LIBZIP
-  PageEntry &entry = impl_->pages[page_index];
+  const PageEntry &entry = impl_->pages[page_index];
   if (entry.size_known && entry.width > 0 && entry.height > 0) {
     w = entry.width;
     h = entry.height;
@@ -322,13 +322,14 @@ bool EpubComicReader::PageSize(int page_index, int &w, int &h) {
   if (!ReadZipEntry(impl_->zip, entry.image_entry, bytes)) return false;
   SDL_Surface *surface = LoadSurfaceFromMemory(bytes.data(), bytes.size());
   if (!surface) return false;
-  entry.width = surface->w;
-  entry.height = surface->h;
-  entry.size_known = (entry.width > 0 && entry.height > 0);
+  PageEntry &mutable_entry = impl_->pages[page_index];
+  mutable_entry.width = surface->w;
+  mutable_entry.height = surface->h;
+  mutable_entry.size_known = (mutable_entry.width > 0 && mutable_entry.height > 0);
   SDL_FreeSurface(surface);
-  if (!entry.size_known) return false;
-  w = entry.width;
-  h = entry.height;
+  if (!mutable_entry.size_known) return false;
+  w = mutable_entry.width;
+  h = mutable_entry.height;
   return true;
 #else
   (void)w;
@@ -337,7 +338,7 @@ bool EpubComicReader::PageSize(int page_index, int &w, int &h) {
 #endif
 }
 
-bool EpubComicReader::CurrentPageSize(int &w, int &h) { return PageSize(CurrentPage(), w, h); }
+bool EpubComicReader::CurrentPageSize(int &w, int &h) const { return PageSize(CurrentPage(), w, h); }
 
 bool EpubComicReader::RenderPageRGBA(int page_index, float scale, std::vector<unsigned char> &rgba, int &w, int &h,
                                      const std::atomic<bool> *cancel) {

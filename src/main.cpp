@@ -1250,7 +1250,9 @@ int main(int, char **) {
         (animate_enabled && (menu_anim.IsAnimating() || scene_flash.IsAnimating() || page_animating || any_grid_animating));
     const bool needs_periodic_tick =
         (state == State::Shelf && title_marquee_active) ||
-        (state == State::Reader && reader_mode == ReaderMode::Pdf && pdf_runtime.IsRenderPending());
+        (state == State::Reader &&
+         ((reader_mode == ReaderMode::Pdf && pdf_runtime.IsRenderPending()) ||
+          (reader_mode == ReaderMode::Epub && epub_runtime.IsRenderPending())));
     const uint32_t loop_now = SDL_GetTicks();
     const bool has_pending_flush =
         config.ShouldFlush(loop_now, kDeferredSaveDelayMs) ||
@@ -1469,7 +1471,6 @@ int main(int, char **) {
       HandleSettingsInput(settings_input_deps);
     } else if (state == State::Reader) {
       if (input.IsJustPressed(Button::B)) {
-        if (reader_mode == ReaderMode::Epub) epub_runtime.CommitPendingNavigation();
         ReaderCloseDeps close_deps{
             reader_ui,
             progress,
@@ -1548,13 +1549,90 @@ int main(int, char **) {
             }
           }
         } else {
-          epub_runtime.HandleInput(input, dt, kReaderTapStepPx);
+          const int epub_rotation = epub_runtime.Progress().rotation;
+          auto epub_scroll_dir_for_button = [&](Button button) -> int {
+            if (epub_rotation == 0) {
+              if (button == Button::Down) return 1;
+              if (button == Button::Up) return -1;
+            } else if (epub_rotation == 90) {
+              if (button == Button::Left) return 1;
+              if (button == Button::Right) return -1;
+            } else if (epub_rotation == 180) {
+              if (button == Button::Up) return 1;
+              if (button == Button::Down) return -1;
+            } else {
+              if (button == Button::Left) return -1;
+              if (button == Button::Right) return 1;
+            }
+            return 0;
+          };
+          auto epub_tap_page_action_for_button = [&](Button button) -> int {
+            if (epub_rotation == 0) {
+              if (button == Button::Right) return 1;
+              if (button == Button::Left) return -1;
+            } else if (epub_rotation == 90) {
+              if (button == Button::Up) return -1;
+              if (button == Button::Down) return 1;
+            } else if (epub_rotation == 180) {
+              if (button == Button::Left) return 1;
+              if (button == Button::Right) return -1;
+            } else {
+              if (button == Button::Up) return 1;
+              if (button == Button::Down) return -1;
+            }
+            return 0;
+          };
+          if (input.IsJustPressed(Button::L2)) {
+            epub_runtime.RotateLeft();
+          }
+          if (input.IsJustPressed(Button::R2)) {
+            epub_runtime.RotateRight();
+          }
+          if (input.IsJustPressed(Button::L1)) {
+            epub_runtime.ZoomOut();
+          }
+          if (input.IsJustPressed(Button::R1)) {
+            epub_runtime.ZoomIn();
+          }
+          if (input.IsJustPressed(Button::A)) {
+            epub_runtime.ResetView();
+          }
+
+          std::array<Button, 4> dirs = {Button::Up, Button::Down, Button::Left, Button::Right};
+          for (Button b : dirs) {
+            int bi = static_cast<int>(b);
+            int long_dir = epub_scroll_dir_for_button(b);
+            if (long_dir == 0) {
+              hold_speed[bi] = 0.0f;
+              continue;
+            }
+            if (input.IsPressed(b) && input.HoldTime(b) >= 0.28f) {
+              long_fired[bi] = true;
+              epub_runtime.ScrollByPixels(long_dir * 20);
+            } else if (!input.IsPressed(b)) {
+              hold_speed[bi] = 0.0f;
+            }
+          }
+
+          for (Button b : dirs) {
+            int bi = static_cast<int>(b);
+            if (!input.IsJustReleased(b)) continue;
+            if (long_fired[bi]) {
+              long_fired[bi] = false;
+              continue;
+            }
+            const int tap_dir = epub_scroll_dir_for_button(b);
+            if (tap_dir != 0) {
+              epub_runtime.ScrollByPixels(tap_dir * 60);
+            } else {
+              const int page_action = epub_tap_page_action_for_button(b);
+              if (page_action != 0) {
+                epub_runtime.JumpByScreen(page_action);
+              }
+            }
+          }
         }
       }
-    }
-
-    if (state == State::Reader && reader_mode != ReaderMode::Txt && reader_mode != ReaderMode::Pdf) {
-      epub_runtime.Tick();
     }
 
     any_grid_animating = false;
@@ -1725,36 +1803,8 @@ int main(int, char **) {
           pdf_runtime.Draw(renderer);
         } else {
           epub_runtime.UpdateViewport(Layout().screen_w, Layout().screen_h);
-          auto draw_centered_reader_label = [&](const std::string &text, int panel_w, int panel_h, SDL_Color panel_color, SDL_Color border_color) {
-            const int panel_x = (Layout().screen_w - panel_w) / 2;
-            const int panel_y = (Layout().screen_h - panel_h) / 2;
-            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, panel_color);
-            DrawRect(renderer, panel_x, panel_y, panel_w, panel_h, border_color, false);
-#ifdef HAVE_SDL2_TTF
-            SDL_Color text_color{244, 246, 250, 255};
-            if (TextCacheEntry *te = get_text_texture(text, text_color); te && te->texture) {
-              SDL_Rect td{
-                  panel_x + std::max(0, (panel_w - te->w) / 2),
-                  panel_y + std::max(0, (panel_h - te->h) / 2),
-                  te->w,
-                  te->h,
-              };
-              SDL_RenderCopy(renderer, te->texture, nullptr, &td);
-            }
-#else
-            (void)text;
-#endif
-          };
-          epub_runtime.Draw(
-              renderer,
-              [&](const std::string &text) {
-                draw_centered_reader_label(text, std::min(Layout().screen_w - 40, 280), 64,
-                                           SDL_Color{16, 16, 18, 200}, SDL_Color{255, 255, 255, 40});
-              },
-              [&](const std::string &text) {
-                draw_centered_reader_label(text, std::min(Layout().screen_w - 40, 320), 76,
-                                           SDL_Color{16, 16, 18, 220}, SDL_Color{255, 255, 255, 48});
-              });
+          epub_runtime.Tick();
+          epub_runtime.Draw(renderer);
         }
 #ifdef HAVE_SDL2_TTF
         if (reader_progress_overlay_visible) {
@@ -1861,10 +1911,9 @@ int main(int, char **) {
       reader.zoom = active_pdf.zoom;
       reader.rotation = active_pdf.rotation;
     } else if (reader_mode == ReaderMode::Epub && epub_runtime.IsOpen()) {
-      epub_runtime.CommitPendingNavigation();
       const EpubRuntimeProgress active_epub = epub_runtime.Progress();
       reader.page = active_epub.page;
-      reader.scroll_x = active_epub.scroll_x;
+      reader.scroll_x = 0;
       reader.scroll_y = active_epub.scroll_y;
       reader.zoom = active_epub.zoom;
       reader.rotation = active_epub.rotation;
