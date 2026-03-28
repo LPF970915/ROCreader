@@ -204,6 +204,12 @@ bool InputManager::AnyPressed() const {
   return false;
 }
 
+void InputManager::ResetAll() {
+  for (auto &s : states_) {
+    s = BtnState{};
+  }
+}
+
 Button InputManager::InvalidButton() { return static_cast<Button>(-1); }
 
 bool InputManager::IsValid(Button b) {

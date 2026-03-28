@@ -56,6 +56,7 @@
 #include "settings_runtime.h"
 #include "sdl_utils.h"
 #include "storage_paths.h"
+#include "system_status.h"
 #include "txt_reader_session.h"
 #include "txt_reader_runtime.h"
 #include "txt_text_service.h"
@@ -745,8 +746,16 @@ int main(int, char **) {
   RecentPathStore favorites_store(favorites_path.string(), NormalizePathKey);
   RecentPathStore history_store(history_path.string(), NormalizePathKey);
   VolumeController volume_controller(use_h700_defaults);
+  SystemStatusMonitor system_status;
   std::cout << "[native_h700] volume controller: prefer_system="
             << (volume_controller.UsesSystemVolume() ? "1" : "0") << "\n";
+  const SystemStatusSnapshot &initial_system_status = system_status.Snapshot();
+  std::cout << "[native_h700] battery monitor: capacity_path=" << system_status.BatteryCapacityPath()
+            << " status_path=" << system_status.BatteryStatusPath()
+            << " percent=" << initial_system_status.battery_percent
+            << " charging=" << (initial_system_status.charging ? "1" : "0")
+            << " charging_text=" << initial_system_status.charging_text
+            << " clock=" << initial_system_status.clock_text << "\n";
   AppUiState app_ui{};
   app_ui.volume_display_percent =
       ClampInt((config.Get().sfx_volume * 100) / std::max(1, SDL_MIX_MAXVOLUME), 0, 100);
@@ -1236,6 +1245,7 @@ int main(int, char **) {
     uint32_t now = SDL_GetTicks();
     float dt = std::max(0.0f, (now - prev_ticks) / 1000.0f);
     prev_ticks = now;
+
     hold_cooldown = std::max(0.0f, hold_cooldown - dt);
     settings_toggle_guard = std::max(0.0f, settings_toggle_guard - dt);
     TickAppUiState(app_ui, dt);
@@ -1273,21 +1283,27 @@ int main(int, char **) {
           if (e.type == SDL_QUIT) running = false;
           input.HandleEvent(e);
         }
-      } else if (has_pending_flush && !needs_periodic_tick) {
+      } else {
+        system_status.Poll(SDL_GetTicks());
+        if (has_pending_flush && !needs_periodic_tick) {
         // Wake only to flush deferred IO; keep the current frame untouched.
-        input.EndFrame();
-        flush_deferred_writes(false);
-        prev_ticks = SDL_GetTicks();
-        continue;
-      } else if (!needs_periodic_tick && !has_pending_flush) {
+          input.EndFrame();
+          flush_deferred_writes(false);
+          prev_ticks = SDL_GetTicks();
+          continue;
+        }
+        if (!needs_periodic_tick && !has_pending_flush) {
         // Fully idle: no input, no animation, no incremental loading.
         // Skip update/render work and keep sleeping until something changes.
-        prev_ticks = SDL_GetTicks();
-        input.EndFrame();
-        continue;
+          prev_ticks = SDL_GetTicks();
+          input.EndFrame();
+          continue;
+        }
       }
     }
     input.EndFrame();
+
+    system_status.Poll(now);
 
     if (reader_mode == ReaderMode::Txt && txt_reader.open && txt_reader.loading) {
       auto deps = make_txt_session_deps();
@@ -1670,6 +1686,7 @@ int main(int, char **) {
       DrawRect(renderer, 0, 0, Layout().screen_w, Layout().screen_h, bg);
 
       std::function<void()> draw_volume_overlay = []() {};
+      std::function<void()> draw_system_status_overlay = []() {};
       if (state == State::Shelf || state == State::Settings) {
         draw_volume_overlay = [&]() {
 #ifdef HAVE_SDL2_TTF
@@ -1682,6 +1699,70 @@ int main(int, char **) {
           const int ty = Layout().top_bar_y + std::max(0, (Layout().top_bar_h - te->h) / 2);
           SDL_Rect td{tx, ty, te->w, te->h};
           SDL_RenderCopy(renderer, te->texture, nullptr, &td);
+#endif
+        };
+        draw_system_status_overlay = [&]() {
+#ifdef HAVE_SDL2_TTF
+          const SystemStatusSnapshot &status = system_status.Snapshot();
+          SDL_Color text_color{238, 242, 250, 255};
+          SDL_Color outline_color{238, 242, 250, 255};
+          SDL_Color fill_color = status.charging ? SDL_Color{104, 214, 141, 255} : SDL_Color{238, 242, 250, 255};
+          if (config.Get().theme != 0) {
+            text_color = SDL_Color{58, 64, 76, 255};
+            outline_color = SDL_Color{58, 64, 76, 255};
+            fill_color = status.charging ? SDL_Color{76, 170, 98, 255} : SDL_Color{58, 64, 76, 255};
+          }
+
+          const int center_y = Layout().top_bar_y + Layout().top_bar_h / 2;
+          const int battery_shift_x = 20;
+          const int battery_shift_y = 3;
+          const int battery_icon_x = 552;
+          const int battery_text_x = 587;
+          const int clock_shift_x = 40;
+          const int clock_shift_y = 3;
+          int clock_right = Layout().screen_w - 16 - clock_shift_x;
+
+          if (!status.clock_text.empty()) {
+            TextCacheEntry *clock_tex = get_text_texture(status.clock_text, text_color);
+            if (clock_tex && clock_tex->texture) {
+              const int clock_x = clock_right - clock_tex->w;
+              const int clock_y = center_y - clock_tex->h / 2 + clock_shift_y;
+              SDL_Rect td{clock_x, clock_y, clock_tex->w, clock_tex->h};
+              SDL_RenderCopy(renderer, clock_tex->texture, nullptr, &td);
+            }
+          }
+
+          if (status.battery_available) {
+            const std::string battery_text = std::to_string(status.battery_percent) + "%";
+            TextCacheEntry *battery_tex = get_text_texture(battery_text, text_color);
+            int battery_text_w = battery_tex ? battery_tex->w : 0;
+            int battery_text_h = battery_tex ? battery_tex->h : 0;
+
+            const int cap_w = 4;
+            const int cap_h = 8;
+            const int body_w = 24;
+            const int body_h = 12;
+            const int icon_x = battery_icon_x;
+            const int icon_y = center_y - body_h / 2 + battery_shift_y;
+
+            DrawRect(renderer, icon_x, icon_y, body_w, body_h, outline_color, false);
+            DrawRect(renderer, icon_x + body_w, center_y - cap_h / 2 + battery_shift_y, cap_w, cap_h, outline_color, true);
+
+            const int inner_pad = 2;
+            const int inner_w = body_w - inner_pad * 2;
+            const int inner_h = body_h - inner_pad * 2;
+            const int fill_w = std::clamp((inner_w * status.battery_percent) / 100, 0, inner_w);
+            if (fill_w > 0) {
+              DrawRect(renderer, icon_x + inner_pad, icon_y + inner_pad, fill_w, inner_h, fill_color, true);
+            }
+
+            if (battery_tex && battery_tex->texture) {
+              SDL_Rect td{battery_text_x, center_y - battery_text_h / 2 + battery_shift_y, battery_text_w, battery_text_h};
+              SDL_RenderCopy(renderer, battery_tex->texture, nullptr, &td);
+            }
+          }
+#else
+          (void)now;
 #endif
         };
         ShelfRuntimeRenderDeps shelf_render_deps{
@@ -1766,6 +1847,7 @@ int main(int, char **) {
             forget_texture_size,
         };
         DrawShelfRuntime(shelf_render_deps);
+        draw_system_status_overlay();
 
         if (state != State::Settings) {
           draw_volume_overlay();
@@ -1883,6 +1965,7 @@ int main(int, char **) {
             draw_volume_overlay,
         };
         DrawSettingsRuntime(settings_render_deps);
+        draw_system_status_overlay();
       }
     }
 

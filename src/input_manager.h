@@ -56,6 +56,7 @@ public:
   bool IsLongPressed(Button b) const;
   float HoldTime(Button b) const;
   bool AnyPressed() const;
+  void ResetAll();
 
 private:
   static Button InvalidButton();
