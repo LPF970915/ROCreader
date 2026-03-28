@@ -20,6 +20,48 @@ APPS_OUT="$DIST_ROOT/APPS"
 RUNTIME_DIR="$APPS_OUT/ROCreader"
 LAUNCHER="$APPS_OUT/ROCreader.sh"
 TARBALL="$DIST_ROOT/ROCreader_APPS_lowglibc.tar.gz"
+# Release rule: Downloads only keeps final versioned zip files.
+# The zip is assembled from dist_lowglibc/release_stage and contains:
+# - Roms/APPS/Imgs/ROCreader.png
+# - Roms/APPS/ROCreader.sh
+# - Roms/APPS/ROCreader/ (with fonts/sounds/lib/lib_system_sdl plus empty books/book_covers/cache)
+DOWNLOADS_ROOT="${DOWNLOADS_ROOT:-$SELF_DIR/Downloads}"
+ZIP_STAGE_ROOT="$DIST_ROOT/release_stage"
+ZIP_STAGE_APPS="$ZIP_STAGE_ROOT/Roms/APPS"
+ZIP_STAGE_RUNTIME="$ZIP_STAGE_APPS/ROCreader"
+ZIP_STAGE_IMGS="$ZIP_STAGE_APPS/Imgs"
+
+next_download_zip() {
+  python3 - "$DOWNLOADS_ROOT" <<'PY'
+import os
+import re
+import sys
+
+downloads = sys.argv[1]
+pattern = re.compile(r"^ROC全能漫画阅读器ver(\d+)\.(\d+)\.zip$")
+best = None
+
+if os.path.isdir(downloads):
+    for name in os.listdir(downloads):
+        match = pattern.match(name)
+        if not match:
+            continue
+        major = int(match.group(1))
+        minor = int(match.group(2))
+        value = (major, minor)
+        if best is None or value > best:
+            best = value
+
+if best is None:
+    major, minor = 0, 1
+else:
+    major, minor = best[0], best[1] + 1
+
+print(os.path.join(downloads, f"ROC全能漫画阅读器ver{major}.{minor}.zip"))
+PY
+}
+
+ZIPFILE="${DOWNLOAD_ZIP_FILE:-$(next_download_zip)}"
 
 if [ ! -d "$SYSROOT" ]; then
   echo "[low_glibc] ERROR: SYSROOT not found: $SYSROOT"
@@ -331,11 +373,22 @@ find_so_in_libdir() {
   mkdir -p "$RUNTIME_DIR/lib_system_sdl"
   mkdir -p "$RUNTIME_DIR/lib/pulseaudio"
   mkdir -p "$RUNTIME_DIR/lib_system_sdl/pulseaudio"
+  mkdir -p "$RUNTIME_DIR/books"
+  mkdir -p "$RUNTIME_DIR/book_covers"
+  mkdir -p "$RUNTIME_DIR/cache"
   cp ./build/rocreader_sdl "$RUNTIME_DIR/"
   if [ -d "$SELF_DIR/ui" ]; then
     command -v python3 >/dev/null 2>&1
     rm -f "$RUNTIME_DIR/ui.pack"
     python3 "$SELF_DIR/scripts/pack_ui_assets.py" "$SELF_DIR/ui" "$RUNTIME_DIR/ui.pack"
+  fi
+  if [ -d "$SELF_DIR/fonts" ]; then
+    rm -rf "$RUNTIME_DIR/fonts"
+    cp -a "$SELF_DIR/fonts" "$RUNTIME_DIR/"
+  fi
+  if [ ! -f "$RUNTIME_DIR/fonts/ui_font.ttf" ]; then
+    echo "[low_glibc] ERROR: packaged font missing in runtime dir: ui_font.ttf"
+    exit 1
   fi
   if [ -d "$SELF_DIR/sounds" ]; then
     rm -rf "$RUNTIME_DIR/sounds"
@@ -565,8 +618,47 @@ EOF
   rm -f "$TARBALL"
   tar -C "$DIST_ROOT" -czf "$TARBALL" APPS
 
+  mkdir -p "$DOWNLOADS_ROOT"
+  rm -rf "$ZIP_STAGE_ROOT"
+  mkdir -p "$ZIP_STAGE_RUNTIME"
+  mkdir -p "$ZIP_STAGE_IMGS"
+  cp -a "$RUNTIME_DIR/." "$ZIP_STAGE_RUNTIME/"
+  mkdir -p "$ZIP_STAGE_RUNTIME/books" "$ZIP_STAGE_RUNTIME/book_covers" "$ZIP_STAGE_RUNTIME/cache"
+  find "$ZIP_STAGE_RUNTIME/books" -mindepth 1 -delete 2>/dev/null || true
+  find "$ZIP_STAGE_RUNTIME/book_covers" -mindepth 1 -delete 2>/dev/null || true
+  find "$ZIP_STAGE_RUNTIME/cache" -mindepth 1 -delete 2>/dev/null || true
+  if [ ! -f "$ZIP_STAGE_RUNTIME/fonts/ui_font.ttf" ]; then
+    echo "[low_glibc] ERROR: packaged font missing in release stage: ui_font.ttf"
+    exit 1
+  fi
+  cp "$LAUNCHER" "$ZIP_STAGE_APPS/ROCreader.sh"
+  if [ -f "$SELF_DIR/ui/ROCreader.png" ]; then
+    cp "$SELF_DIR/ui/ROCreader.png" "$ZIP_STAGE_IMGS/ROCreader.png"
+  fi
+  rm -f "$ZIPFILE"
+  ZIP_SRC="$ZIP_STAGE_ROOT" ZIP_DST="$ZIPFILE" python3 - <<'PY'
+import os
+import zipfile
+
+src = os.environ["ZIP_SRC"]
+dst = os.environ["ZIP_DST"]
+
+with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+    for root, dirs, files in os.walk(src):
+        dirs.sort()
+        files.sort()
+        rel_root = os.path.relpath(root, src)
+        if rel_root != ".":
+            zf.write(root, rel_root.replace("\\", "/") + "/")
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, src).replace("\\", "/")
+            zf.write(full, rel)
+PY
+
   echo "[low_glibc] done"
   echo "[low_glibc] output: $TARBALL"
+  echo "[low_glibc] download zip: $ZIPFILE"
 } >>"$LOG_FILE" 2>&1
 
 echo "[low_glibc] log: $LOG_FILE"

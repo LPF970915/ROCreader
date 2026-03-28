@@ -111,9 +111,30 @@ REQUIRE_MUPDF=1 \
 ./cross_compile_low_glibc.sh
 ```
 
-Output package:
+Output packages:
 
 - `dist_lowglibc/ROCreader_APPS_lowglibc.tar.gz`
+- `Downloads/ROC全能漫画阅读器verX.Y.zip`
+
+Release zip rules:
+
+- `Downloads` only stores final release `.zip` files
+- staging files are generated under `dist_lowglibc/release_stage`
+- zip root contains:
+  - `Roms/APPS/Imgs/ROCreader.png`
+  - `Roms/APPS/ROCreader.sh`
+  - `Roms/APPS/ROCreader/`
+- `Roms/APPS/ROCreader/` contains the full runtime payload:
+  - `rocreader_sdl`
+  - `ui.pack`
+  - `native_config.ini`
+  - `native_keymap.ini`
+  - `fonts/`
+  - `sounds/`
+  - `lib/`
+  - `lib_system_sdl/`
+  - empty `books/`, `book_covers/`, `cache/` directories
+- zip version is auto-incremented from the latest existing `ROC全能漫画阅读器verX.Y.zip`
 
 ## Runtime Crash Logs (on device)
 

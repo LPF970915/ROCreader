@@ -59,39 +59,91 @@ void OpenUiFonts(UiTextCacheState &state, const std::filesystem::path &exe_path,
   state.font_attempted = true;
   if (state.font) return;
   const std::vector<std::string> candidates = {
+      (exe_path / "fonts" / "ui_font_02.ttf").lexically_normal().string(),
+      (exe_path / "fonts" / "ui_font.ttf").lexically_normal().string(),
+      (exe_path.parent_path() / "fonts" / "ui_font_02.ttf").lexically_normal().string(),
+      (exe_path.parent_path() / "fonts" / "ui_font.ttf").lexically_normal().string(),
+      (std::filesystem::current_path() / "fonts" / "ui_font_02.ttf").lexically_normal().string(),
+      (std::filesystem::current_path() / "fonts" / "ui_font.ttf").lexically_normal().string(),
+      (ui_path.parent_path() / "fonts" / "ui_font_02.ttf").lexically_normal().string(),
+      (ui_path.parent_path() / "fonts" / "ui_font.ttf").lexically_normal().string(),
+      (exe_path / ".." / "ui_font_02.ttf").lexically_normal().string(),
       (exe_path / ".." / "ui_font.ttf").lexically_normal().string(),
+      (std::filesystem::current_path() / "ui_font_02.ttf").lexically_normal().string(),
       (std::filesystem::current_path() / "ui_font.ttf").lexically_normal().string(),
+      "ui_font_02.ttf",
       "ui_font.ttf",
+      (ui_path / "fonts" / "ui_font_02.ttf").string(),
       (ui_path / "fonts" / "ui_font.ttf").string(),
       (ui_path / "fonts" / "ui_font.otf").string(),
-      (exe_path / "fonts" / "ui_font.ttf").string(),
-      (exe_path.parent_path() / "fonts" / "ui_font.ttf").string(),
       "C:/Windows/Fonts/msyh.ttc",
       "C:/Windows/Fonts/msyh.ttf",
       "C:/Windows/Fonts/simhei.ttf",
       "C:/Windows/Fonts/simsun.ttc",
       "C:/Windows/Fonts/arial.ttf",
+      "/Roms/APPS/ROCreader/fonts/ui_font_02.ttf",
       "/Roms/APPS/ROCreader/fonts/ui_font.ttf",
+      "/mnt/mmc/ROCreader/fonts/ui_font_02.ttf",
       "/mnt/mmc/ROCreader/fonts/ui_font.ttf",
+      "/mnt/mmc/Roms/ROCreader/fonts/ui_font_02.ttf",
       "/mnt/mmc/Roms/ROCreader/fonts/ui_font.ttf",
+      "/mnt/mmc2/ROCreader/fonts/ui_font_02.ttf",
       "/mnt/mmc2/ROCreader/fonts/ui_font.ttf",
+      "/mnt/mmc2/Roms/ROCreader/fonts/ui_font_02.ttf",
       "/mnt/mmc2/Roms/ROCreader/fonts/ui_font.ttf",
       "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
       "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
   };
   for (const auto &path : candidates) {
     if (!std::filesystem::exists(path)) continue;
-    state.font = TTF_OpenFont(path.c_str(), 16);
-    if (!state.font) continue;
-    state.title_font = TTF_OpenFont(path.c_str(), 24);
-    state.reader_font = TTF_OpenFont(path.c_str(), reader_font_pt);
-    std::cout << "[native_h700] ui font: " << path;
-    if (path.find("ui_font.ttf") != std::string::npos) std::cout << " (project font)";
-    std::cout << "\n";
+    std::cout << "[native_h700] ui font try: " << path << "\n";
+    TTF_Font *font = TTF_OpenFont(path.c_str(), 16);
+    if (!font) {
+      std::cerr << "[native_h700] ui font open failed: body path=" << path
+                << " err=" << TTF_GetError() << "\n";
+      continue;
+    }
+    TTF_Font *title_font = TTF_OpenFont(path.c_str(), 24);
+    if (!title_font) {
+      std::cerr << "[native_h700] ui font open failed: title path=" << path
+                << " err=" << TTF_GetError() << "\n";
+      TTF_CloseFont(font);
+      continue;
+    }
+    TTF_Font *reader_font = TTF_OpenFont(path.c_str(), reader_font_pt);
+    if (!reader_font) {
+      std::cerr << "[native_h700] ui font open failed: reader path=" << path
+                << " pt=" << reader_font_pt
+                << " err=" << TTF_GetError() << "\n";
+      TTF_CloseFont(title_font);
+      TTF_CloseFont(font);
+      continue;
+    }
+    state.font = font;
+    state.title_font = title_font;
+    state.reader_font = reader_font;
+    std::cout << "[native_h700] ui font selected: " << path;
+    if (path.find("ui_font.ttf") != std::string::npos ||
+        path.find("ui_font_02.ttf") != std::string::npos) {
+      std::cout << " (project font)";
+    }
+    std::cout << " reader_pt=" << reader_font_pt << "\n";
     break;
   }
-  if (!state.font) {
-    std::cerr << "[native_h700] warning: ui font not found, title text disabled\n";
+  if (!state.font || !state.title_font || !state.reader_font) {
+    if (state.reader_font) {
+      TTF_CloseFont(state.reader_font);
+      state.reader_font = nullptr;
+    }
+    if (state.title_font) {
+      TTF_CloseFont(state.title_font);
+      state.title_font = nullptr;
+    }
+    if (state.font) {
+      TTF_CloseFont(state.font);
+      state.font = nullptr;
+    }
+    std::cerr << "[native_h700] warning: ui fonts not fully available; body/title/reader text disabled\n";
   }
 #endif
 }
