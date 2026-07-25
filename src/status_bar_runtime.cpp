@@ -36,7 +36,7 @@ void DrawStatusBarRuntime(const StatusBarRenderDeps &deps) {
   const int clock_shift_y = trimui_brick_status_layout ? 5 : (gkd350h_ultra_status_layout ? 0 : scale_px(3));
   int clock_right = trimui_brick_status_layout ? deps.screen_w - 26 - clock_shift_x
                     : gkd350h_ultra_status_layout ? 1468
-                                                 : status_x(664);
+                                                 : deps.screen_w - 16 - clock_shift_x;
 
   if (!status.clock_text.empty()) {
     TextCacheEntry *clock_tex = deps.get_text_texture ? deps.get_text_texture(status.clock_text, text_color) : nullptr;
