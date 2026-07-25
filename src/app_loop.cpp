@@ -2221,6 +2221,7 @@ int RunApp(int argc, char **argv) {
   };
 
   uint32_t prev_ticks = SDL_GetTicks();
+  uint32_t force_quit_chord_started_at = 0;
   while (app_shell.IsRunning()) {
     const AppFrameTiming frame = app_shell.BeginFrame(prev_ticks);
     const uint32_t frame_begin_ticks = frame.frame_begin_ticks;
@@ -2581,9 +2582,14 @@ int RunApp(int argc, char **argv) {
       if (rgds_input_result.play_back_sfx) play_sfx(SfxId::Back);
     }
     if (!key_calibration_capturing && input.IsPressed(Button::Start) && input.IsPressed(Button::Select)) {
-      runtime_log::Line(std::string("main: quit requested by Start+Select chord profile=") +
-                        InputProfileName(input_profile));
-      app_shell.RequestQuit();
+      if (force_quit_chord_started_at == 0) force_quit_chord_started_at = now;
+      if (now - force_quit_chord_started_at >= 1500) {
+        runtime_log::Line(std::string("main: quit requested by held Start+Select chord profile=") +
+                          InputProfileName(input_profile));
+        app_shell.RequestQuit();
+      }
+    } else {
+      force_quit_chord_started_at = 0;
     }
 
     if (is_rgds_runtime) {
