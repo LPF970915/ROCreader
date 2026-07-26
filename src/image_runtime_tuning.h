@@ -25,6 +25,18 @@ inline bool RgdsFastMode() {
   return enabled;
 }
 
+inline bool StopScreenJumpAtPageEnd(int viewport_w, int viewport_h) {
+  const char *override_value = std::getenv("ROCREADER_IMAGE_STOP_JUMP_AT_PAGE_END");
+  if (override_value && *override_value) return !EqualsToken(override_value, "0");
+
+  const char *device = std::getenv("ROCREADER_DEVICE_MODEL");
+  if (EqualsToken(device, "gkd350h-ultra") || EqualsToken(device, "gkd350hultra") ||
+      EqualsToken(device, "gkd350h")) {
+    return true;
+  }
+  return viewport_w == 1600 && viewport_h == 1440;
+}
+
 inline int ReadEnvInt(const char *name, int fallback, int min_value, int max_value) {
   const char *value = std::getenv(name);
   if (!value || !*value) return fallback;

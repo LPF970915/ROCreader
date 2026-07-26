@@ -1544,8 +1544,18 @@ void ZipImageRuntime::JumpByScreen(int direction) {
   impl_->MarkInteraction();
   const int old_page = impl_->target_state.location.page_num;
   impl_->preferred_prefetch_dir = (direction > 0) ? 1 : -1;
-  impl_->target_state.location.y_offset += direction * impl_->screen_h;
-  impl_->NormalizeState(impl_->target_state);
+  ZipImageState next_state = impl_->target_state;
+  next_state.location.y_offset += direction * impl_->ViewportFlowExtent(next_state);
+  if (direction > 0 &&
+      image_runtime_tuning::StopScreenJumpAtPageEnd(impl_->screen_w, impl_->screen_h)) {
+    const int page_end = impl_->TransitionStartYOffset(impl_->target_state);
+    if (impl_->target_state.location.y_offset < page_end &&
+        next_state.location.y_offset > page_end) {
+      next_state.location.y_offset = page_end;
+    }
+  }
+  impl_->NormalizeState(next_state);
+  impl_->target_state = next_state;
   if (impl_->target_state.location.page_num != old_page) {
     impl_->target_state.location.x_offset = 0;
     if (impl_->TryUseCachedTarget()) return;
