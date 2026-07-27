@@ -201,6 +201,44 @@ struct PageEntry {
   bool size_known = false;
 };
 
+int CompareNaturalImagePath(const std::string &a, const std::string &b) {
+  size_t ai = 0;
+  size_t bi = 0;
+  while (ai < a.size() && bi < b.size()) {
+    const unsigned char ac = static_cast<unsigned char>(a[ai]);
+    const unsigned char bc = static_cast<unsigned char>(b[bi]);
+    if (std::isdigit(ac) && std::isdigit(bc)) {
+      const size_t a_digits = ai;
+      const size_t b_digits = bi;
+      while (ai < a.size() && std::isdigit(static_cast<unsigned char>(a[ai]))) ++ai;
+      while (bi < b.size() && std::isdigit(static_cast<unsigned char>(b[bi]))) ++bi;
+
+      size_t a_significant = a_digits;
+      size_t b_significant = b_digits;
+      while (a_significant < ai && a[a_significant] == '0') ++a_significant;
+      while (b_significant < bi && b[b_significant] == '0') ++b_significant;
+      const size_t a_length = ai - a_significant;
+      const size_t b_length = bi - b_significant;
+      if (a_length != b_length) return a_length < b_length ? -1 : 1;
+      const int numeric_compare = a.compare(a_significant, a_length, b, b_significant, b_length);
+      if (numeric_compare != 0) return numeric_compare < 0 ? -1 : 1;
+
+      const size_t a_zeroes = a_significant - a_digits;
+      const size_t b_zeroes = b_significant - b_digits;
+      if (a_zeroes != b_zeroes) return a_zeroes > b_zeroes ? -1 : 1;
+      continue;
+    }
+
+    const int a_lower = std::tolower(ac);
+    const int b_lower = std::tolower(bc);
+    if (a_lower != b_lower) return a_lower < b_lower ? -1 : 1;
+    ++ai;
+    ++bi;
+  }
+  if (ai == a.size() && bi == b.size()) return 0;
+  return ai == a.size() ? -1 : 1;
+}
+
 } // namespace
 
 struct ZipImageReader::Impl {
@@ -236,6 +274,10 @@ bool ZipImageReader::Open(const std::string &path) {
     zip_close(za);
     return false;
   }
+
+  std::stable_sort(pages.begin(), pages.end(), [](const PageEntry &a, const PageEntry &b) {
+    return CompareNaturalImagePath(a.image_entry, b.image_entry) < 0;
+  });
 
   runtime_log::Line("[zip_image] image pages path=" + path +
                     " pages=" + std::to_string(pages.size()) +
