@@ -199,6 +199,7 @@ struct PageEntry {
   int width = 0;
   int height = 0;
   bool size_known = false;
+  bool size_probe_attempted = false;
 };
 
 int CompareNaturalImagePath(const std::string &a, const std::string &b) {
@@ -369,34 +370,49 @@ bool ZipImageReader::PageSize(int page_index, int &w, int &h) const {
   if (!IsOpen()) return false;
   page_index = std::clamp(page_index, 0, PageCount() - 1);
 #ifdef HAVE_LIBZIP
-  const PageEntry &entry = impl_->pages[page_index];
+  PageEntry &entry = impl_->pages[page_index];
   if (entry.size_known && entry.width > 0 && entry.height > 0) {
     w = entry.width;
     h = entry.height;
     return true;
   }
+  if (entry.size_probe_attempted) return false;
+  entry.size_probe_attempted = true;
 
   std::vector<unsigned char> bytes;
-  if (!ReadZipEntryPrefix(impl_->zip, entry.image_entry, 64 * 1024, bytes)) {
-    runtime_log::Line("[zip_image] page size read failed page=" + std::to_string(page_index) +
-                      " entry=" + entry.image_entry);
-    return false;
-  }
   int probed_w = 0;
   int probed_h = 0;
-  if (!ProbeImageSizeFromMemory(bytes.data(), bytes.size(), probed_w, probed_h)) {
+  bool probed = ReadZipEntryPrefix(impl_->zip, entry.image_entry, 64 * 1024, bytes) &&
+                ProbeImageSizeFromMemory(bytes.data(), bytes.size(), probed_w, probed_h);
+  if (!probed) {
+    bytes.clear();
+    if (!ReadZipEntry(impl_->zip, entry.image_entry, bytes)) {
+      runtime_log::Line("[zip_image] page size read failed page=" + std::to_string(page_index) +
+                        " entry=" + entry.image_entry);
+      return false;
+    }
+    probed = ProbeImageSizeFromMemory(bytes.data(), bytes.size(), probed_w, probed_h);
+    if (!probed) {
+      SDL_Surface *surface = DecodeSurfaceFromMemory(bytes.data(), bytes.size());
+      if (surface) {
+        probed_w = surface->w;
+        probed_h = surface->h;
+        SDL_FreeSurface(surface);
+        probed = probed_w > 0 && probed_h > 0;
+      }
+    }
+  }
+  if (!probed) {
     runtime_log::Line("[zip_image] page size probe failed page=" + std::to_string(page_index) +
-                      " entry=" + entry.image_entry +
-                      " bytes=" + std::to_string(bytes.size()));
+                      " entry=" + entry.image_entry + " bytes=" + std::to_string(bytes.size()));
     return false;
   }
-  PageEntry &mutable_entry = impl_->pages[page_index];
-  mutable_entry.width = probed_w;
-  mutable_entry.height = probed_h;
-  mutable_entry.size_known = (mutable_entry.width > 0 && mutable_entry.height > 0);
-  if (!mutable_entry.size_known) return false;
-  w = mutable_entry.width;
-  h = mutable_entry.height;
+  entry.width = probed_w;
+  entry.height = probed_h;
+  entry.size_known = entry.width > 0 && entry.height > 0;
+  if (!entry.size_known) return false;
+  w = entry.width;
+  h = entry.height;
   return true;
 #else
   (void)w;
