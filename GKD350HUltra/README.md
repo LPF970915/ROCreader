@@ -141,6 +141,32 @@ From PowerShell on Windows:
 .\GKD350HUltra\build_low_glibc.ps1
 ```
 
+The GKD release ZIP uses the IUX external-app layout:
+
+```text
+app/
+  ROCreader/
+    config.json
+    launch.sh
+    rocreader.png
+    rocreader_sdl
+    books/
+    book_covers/
+roms/
+  ports/
+    ROCreader.sh  # ES entry forwarding to app/ROCreader
+```
+
+Extract it at the external card root. IUX discovers the application at
+`/storage/games-external/app/ROCreader`. ES discovers the ports entry and
+forwards to the same IUX runtime. The launcher also accepts legacy
+`Roms/ports` archives for in-app update compatibility.
+
+`rocreader.png` comes from `ui/common/icon.png`. Package verification ensures
+that the selected source is the icon shipped in the ZIP. Its app-specific
+filename is required because IUX resolves `icon.png` to the skin's generic
+software icon before checking the external application directory.
+
 GKD builds now require a real PDF backend. The observed ROCKNIX sysroot ships
 `libpoppler.so.128` but not `libpoppler-cpp`, so the current test sysroot uses
 the existing TrimuiBrick aarch64 Poppler-C++ overlay for:

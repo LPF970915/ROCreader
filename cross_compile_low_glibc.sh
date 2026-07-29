@@ -47,11 +47,16 @@ TARBALL="$DIST_ROOT/ROCreader_APPS_lowglibc.tar.gz"
 # - Roms/APPS/ROCreader/ by default, or the configured release parent path.
 DOWNLOADS_ROOT="${DOWNLOADS_ROOT:-$DEFAULT_DOWNLOADS_ROOT}"
 RELEASE_PARENT_DIR="${ROCREADER_RELEASE_PARENT_DIR:-Roms/APPS}"
+RELEASE_IUX_APP="${ROCREADER_RELEASE_IUX_APP:-0}"
 RELEASE_INCLUDE_IMGS="${ROCREADER_RELEASE_INCLUDE_IMGS:-1}"
 PACKAGE_ONLINE_SOURCES="${ROCREADER_PACKAGE_ONLINE_SOURCES:-1}"
 ZIP_STAGE_ROOT="$DIST_ROOT/release_stage"
 if [ "$TRIMUI_BRICK_LAYOUT" = "1" ]; then
   ZIP_STAGE_APPS="$ZIP_STAGE_ROOT/Apps"
+  ZIP_STAGE_RUNTIME="$ZIP_STAGE_APPS/ROCreader"
+  ZIP_STAGE_IMGS="$ZIP_STAGE_RUNTIME"
+elif [ "$RELEASE_IUX_APP" = "1" ]; then
+  ZIP_STAGE_APPS="$ZIP_STAGE_ROOT/$RELEASE_PARENT_DIR"
   ZIP_STAGE_RUNTIME="$ZIP_STAGE_APPS/ROCreader"
   ZIP_STAGE_IMGS="$ZIP_STAGE_RUNTIME"
 else
@@ -1407,14 +1412,44 @@ PY
     exit 1
   fi
   if [ "$TRIMUI_BRICK_LAYOUT" != "1" ]; then
-    if [ "$RELEASE_INCLUDE_IMGS" = "1" ]; then
+    if [ "$RELEASE_IUX_APP" = "1" ]; then
+      cp "$LAUNCHER" "$ZIP_STAGE_RUNTIME/launch.sh"
+      mkdir -p "$ZIP_STAGE_ROOT/roms/ports"
+      cp "$LAUNCHER" "$ZIP_STAGE_ROOT/roms/ports/ROCreader.sh"
+      IUX_ICON="$SELF_DIR/ui/common/icon.png"
+      [ -f "$IUX_ICON" ] || { echo "[low_glibc] ERROR: missing IUX icon: $IUX_ICON"; exit 1; }
+      cp "$IUX_ICON" "$ZIP_STAGE_RUNTIME/rocreader.png"
+      CONFIG_VERSION="${RELEASE_VERSION#ver}"
+      python3 - "$ZIP_STAGE_RUNTIME/config.json" "$CONFIG_VERSION" <<'PY'
+import json
+import sys
+
+path, version = sys.argv[1:]
+config = {
+    "software_code": "rocreader",
+    "title": "ROCreader",
+    "description": "ROC reader",
+    "version": version,
+    "exec": "launch.sh",
+    "workdir": ".",
+    "icon": "rocreader.png",
+}
+with open(path, "w", encoding="utf-8", newline="\n") as stream:
+    json.dump(config, stream, ensure_ascii=False, indent=2)
+    stream.write("\n")
+PY
+      chmod +x "$ZIP_STAGE_RUNTIME/launch.sh" "$ZIP_STAGE_ROOT/roms/ports/ROCreader.sh" \
+        "$ZIP_STAGE_RUNTIME/rocreader_sdl" 2>/dev/null || true
+    elif [ "$RELEASE_INCLUDE_IMGS" = "1" ]; then
       mkdir -p "$ZIP_STAGE_IMGS"
-    fi
-    cp "$LAUNCHER" "$ZIP_STAGE_APPS/ROCreader.sh"
-    if [ "$RELEASE_INCLUDE_IMGS" = "1" ] && [ -f "$SELF_DIR/ui/ROCreader.png" ]; then
-      cp "$SELF_DIR/ui/ROCreader.png" "$ZIP_STAGE_IMGS/ROCreader.png"
-    elif [ "$RELEASE_INCLUDE_IMGS" = "1" ] && [ -f "$SELF_DIR/ui/common/ROCreader.png" ]; then
-      cp "$SELF_DIR/ui/common/ROCreader.png" "$ZIP_STAGE_IMGS/ROCreader.png"
+      cp "$LAUNCHER" "$ZIP_STAGE_APPS/ROCreader.sh"
+      if [ -f "$SELF_DIR/ui/ROCreader.png" ]; then
+        cp "$SELF_DIR/ui/ROCreader.png" "$ZIP_STAGE_IMGS/ROCreader.png"
+      elif [ -f "$SELF_DIR/ui/common/ROCreader.png" ]; then
+        cp "$SELF_DIR/ui/common/ROCreader.png" "$ZIP_STAGE_IMGS/ROCreader.png"
+      fi
+    else
+      cp "$LAUNCHER" "$ZIP_STAGE_APPS/ROCreader.sh"
     fi
   fi
   rm -f "$ZIPFILE"
@@ -1437,6 +1472,52 @@ with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
             rel = os.path.relpath(full, src).replace("\\", "/")
             zf.write(full, rel)
 PY
+
+  if [ "$RELEASE_IUX_APP" = "1" ]; then
+    python3 - "$ZIPFILE" "$CONFIG_VERSION" "$SELF_DIR/ui/common/icon.png" <<'PY'
+import json
+import sys
+import zipfile
+
+archive_path, expected_version, expected_icon_path = sys.argv[1:]
+app_root = "app/ROCreader"
+required = {
+    f"{app_root}/config.json",
+    f"{app_root}/launch.sh",
+    f"{app_root}/rocreader.png",
+    f"{app_root}/rocreader_sdl",
+    f"{app_root}/ui.pack",
+    "roms/ports/ROCreader.sh",
+}
+with zipfile.ZipFile(archive_path) as archive:
+    names = set(archive.namelist())
+    missing = sorted(required - names)
+    if missing:
+        raise SystemExit(f"IUX release is missing: {missing[0]}")
+    if any(name.startswith("roms/ports/ROCreader/") for name in names):
+        raise SystemExit("IUX release duplicated the ROCreader runtime under ports")
+    with open(expected_icon_path, "rb") as stream:
+        expected_icon = stream.read()
+    packaged_icon = archive.read(f"{app_root}/rocreader.png")
+    if packaged_icon != expected_icon:
+        raise SystemExit("packaged IUX icon does not match ui/common/icon.png")
+    if len(packaged_icon) < 26 or packaged_icon[:8] != b"\x89PNG\r\n\x1a\n" or packaged_icon[25] != 6:
+        raise SystemExit("IUX icon must be an RGBA PNG (PNG color type 6)")
+    config = json.loads(archive.read(f"{app_root}/config.json").decode("utf-8"))
+    expected = {
+        "software_code": "rocreader",
+        "title": "ROCreader",
+        "version": expected_version,
+        "exec": "launch.sh",
+        "workdir": ".",
+        "icon": "rocreader.png",
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise SystemExit(f"invalid IUX config field: {key}")
+print(f"[low_glibc] verified IUX/ES release layout: {archive_path}")
+PY
+  fi
 
   if [ "${LEGACY_DOWNLOADS_MIRROR:-1}" = "1" ] && [ "$TRIMUI_BRICK_LAYOUT" != "1" ] &&
      { [ -z "${DOWNLOAD_TARGET_SUFFIX:-}" ] || [ "${DOWNLOAD_TARGET_SUFFIX:-}" = "H700" ]; }; then

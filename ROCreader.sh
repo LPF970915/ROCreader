@@ -2,9 +2,28 @@
 set -eu
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+LAUNCHER_PATH="$SELF_DIR/$(basename "$0")"
+
+# The ES ports entry and the IUX application share one runtime. Keep the full
+# launcher in ports as a fallback for legacy installations without app/.
+case "$SELF_DIR" in
+  */ports)
+    for iux_launcher in \
+      /storage/games-external/app/ROCreader/launch.sh \
+      "$SELF_DIR/../../app/ROCreader/launch.sh"; do
+      if [ -x "$iux_launcher" ]; then
+        exec "$iux_launcher" "$@"
+      fi
+    done
+    ;;
+esac
+
 APP_DIR="$SELF_DIR/ROCreader"
+if [ ! -d "$APP_DIR" ]; then
+  APP_DIR="$SELF_DIR"
+fi
 BIN="$APP_DIR/rocreader_sdl"
-LOG_FILE="${ROC_NATIVE_RUNTIME_LOG:-$SELF_DIR/ROCreader.log}"
+LOG_FILE="${ROC_NATIVE_RUNTIME_LOG:-$APP_DIR/ROCreader.log}"
 LIB_FULL_DIR="$APP_DIR/lib"
 LIB_SYSTEM_SDL_DIR="$APP_DIR/lib_system_sdl"
 MANUAL_WEB_TRANSPORT_DIR="$APP_DIR/manual_web_transport"
@@ -395,6 +414,8 @@ extract_zip_to_stage() {
 find_staged_runtime_dir() {
   stage_dir="$1"
   for candidate in \
+    "$stage_dir/app/ROCreader" \
+    "$stage_dir/roms/ports/ROCreader" \
     "$stage_dir/Roms/ports/ROCreader" \
     "$stage_dir/Roms/APPS/ROCreader" \
     "$stage_dir/APPS/ROCreader" \
@@ -408,12 +429,26 @@ find_staged_runtime_dir() {
 find_staged_launcher_file() {
   stage_dir="$1"
   for candidate in \
+    "$stage_dir/app/ROCreader/launch.sh" \
+    "$stage_dir/roms/ports/ROCreader.sh" \
     "$stage_dir/Roms/ports/ROCreader.sh" \
     "$stage_dir/Roms/APPS/ROCreader.sh" \
     "$stage_dir/APPS/ROCreader.sh"; do
     [ -f "$candidate" ] && { printf '%s' "$candidate"; return 0; }
   done
   return 1
+}
+
+install_es_launcher_if_present() {
+  staged_es_launcher="$UPDATE_STAGE_DIR/roms/ports/ROCreader.sh"
+  [ -f "$staged_es_launcher" ] || return 0
+  for ports_dir in /storage/roms/ports "$APP_DIR/../../roms/ports"; do
+    [ -d "$ports_dir" ] || continue
+    cp "$staged_es_launcher" "$ports_dir/ROCreader.sh.new"
+    chmod +x "$ports_dir/ROCreader.sh.new" 2>/dev/null || true
+    mv "$ports_dir/ROCreader.sh.new" "$ports_dir/ROCreader.sh"
+    return 0
+  done
 }
 
 replace_runtime_entry() {
@@ -492,14 +527,18 @@ perform_pending_update_if_any() {
   replace_runtime_entry "sounds" "$staged_runtime"
   replace_runtime_entry "lib" "$staged_runtime"
   replace_runtime_entry "lib_system_sdl" "$staged_runtime"
+  replace_runtime_entry "config.json" "$staged_runtime"
+  replace_runtime_entry "rocreader.png" "$staged_runtime"
+  replace_runtime_entry "icon.png" "$staged_runtime"
 
-  if [ -f "$staged_launcher" ]; then
-    cp "$staged_launcher" "$SELF_DIR/ROCreader.sh.new"
-    mv "$SELF_DIR/ROCreader.sh.new" "$SELF_DIR/ROCreader.sh"
+  if [ -n "$staged_launcher" ] && [ -f "$staged_launcher" ]; then
+    cp "$staged_launcher" "$LAUNCHER_PATH.new"
+    mv "$LAUNCHER_PATH.new" "$LAUNCHER_PATH"
   fi
+  install_es_launcher_if_present
 
   chmod +x "$APP_DIR/rocreader_sdl" 2>/dev/null || true
-  chmod +x "$SELF_DIR/ROCreader.sh" 2>/dev/null || true
+  chmod +x "$LAUNCHER_PATH" 2>/dev/null || true
 
   write_installed_version "$package_version"
   rm -f "$APP_DIR/Downloads/ROCreader_update_pending.txt" /mnt/mmc/Downloads/ROCreader_update_pending.txt /mnt/sdcard/Downloads/ROCreader_update_pending.txt /mnt/SDCARD/Downloads/ROCreader_update_pending.txt

@@ -13,6 +13,11 @@ src/*.o
 book_covers/
 books/
 ui/
+!ui/
+ui/*
+!ui/common/
+ui/common/*
+!ui/common/icon.png
 sounds/
 trimui-smart-pro-toolchain/
 TrimuiBrick/toolchain/
