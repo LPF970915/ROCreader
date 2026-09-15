@@ -149,7 +149,6 @@ constexpr uint32_t kTransientMessageDurationMs = 1800;
 constexpr uint32_t kReaderFastFlipThresholdMs = 200;
 constexpr uint32_t kReaderPageFlipDebounceMs = 150;
 constexpr int kTxtLineSpacing = 8;
-constexpr int kTxtLayoutCacheVersion = 6;
 constexpr size_t kTxtMaxBytes = 64 * 1024 * 1024;
 constexpr size_t kTxtMaxWrappedLines = 250000;
 constexpr size_t kTxtLayoutCacheMaxEntries = 4;
@@ -826,6 +825,8 @@ int RunApp(int argc, char **argv) {
   enum class ScreenOffMode { Awake, Manual, Auto };
   ScreenOffMode screen_off_mode = ScreenOffMode::Awake;
   bool rgds_display_sleep_active = false;
+  const bool is_rgds_plus = is_rgds_runtime && device_model_token == "rgds-plus";
+  RgdsPlusLidMonitor rgds_plus_lid;
   uint32_t power_key_ignore_until_tick = 0;
   uint32_t gkd_power_wake_due_tick = 0;
   uint32_t input_wake_next_resync_tick = 0;
@@ -1439,8 +1440,8 @@ int RunApp(int argc, char **argv) {
     if (ui_text_cache.reader_font) font_h = TTF_FontHeight(ui_text_cache.reader_font);
 #endif
     const bool use_rgds_virtual_canvas = is_rgds_runtime;
-    const int viewport_w = use_rgds_virtual_canvas ? rgds::kVirtualReaderW : Layout().screen_w;
-    const int viewport_h = use_rgds_virtual_canvas ? rgds::kVirtualReaderH : Layout().screen_h;
+    const int viewport_w = use_rgds_virtual_canvas ? rgds::VirtualReaderW() : Layout().screen_w;
+    const int viewport_h = use_rgds_virtual_canvas ? rgds::VirtualReaderH() : Layout().screen_h;
     SDL_Rect bounds = GetTxtViewportBounds(
         use_rgds_virtual_canvas ? nullptr : renderer,
         TxtViewportRequest{
@@ -2220,6 +2221,24 @@ int RunApp(int argc, char **argv) {
     };
   };
 
+  auto persist_active_reader_progress = [&]() {
+    if (current_book.empty()) return;
+    const IReaderModule *module = reader_manager.Module(reader_mode);
+    if (module && module->IsOpen()) {
+      reader = module->Progress();
+      if (reader_mode == ReaderMode::Epub &&
+          std::string(module->BackendName()) == "epub-flow") reader.scroll_x = 0;
+      if (reader_mode == ReaderMode::Txt) {
+        reader_ui.Txt().resume_cache_dirty = true;
+        persist_current_txt_resume_snapshot(current_book, true);
+      }
+    } else if (state != AppScene::Reader) {
+      return;
+    }
+    progress.Set(current_book, reader);
+    history_store.Add(current_book);
+  };
+
   uint32_t prev_ticks = SDL_GetTicks();
   uint32_t force_quit_chord_started_at = 0;
   while (app_shell.IsRunning()) {
@@ -2284,7 +2303,17 @@ int RunApp(int argc, char **argv) {
       if (screen_off_mode != ScreenOffMode::Awake) return;
       last_user_input_tick = SDL_GetTicks();
     };
+    bool rgds_plus_lid_requested = false;
+    bool rgds_plus_auto_requested = false;
     auto maybe_trigger_auto_sleep = [&]() {
+      if (is_rgds_plus) {
+        const uint32_t tick = SDL_GetTicks();
+        rgds_plus_lid_requested = rgds_plus_lid.Poll(tick, lid_power_controller.Enabled());
+        rgds_plus_auto_requested = config.Get().lid_close_screen_off &&
+            tick - last_user_input_tick >=
+                AutoSleepIntervalMsFromIndex(system_settings_state.auto_sleep_interval_index);
+        return;
+      }
       const bool supports_auto_sleep =
           use_h700_defaults || input_profile == InputProfile::GKD350HUltra;
       if (screen_off_mode != ScreenOffMode::Awake || !supports_auto_sleep || !config.Get().lid_close_screen_off) return;
@@ -2327,7 +2356,8 @@ int RunApp(int argc, char **argv) {
             if (screen_off_mode == ScreenOffMode::Awake) last_user_input_tick = SDL_GetTicks();
             input_end_frame_done = true;
           }
-          if (!observed_input_this_frame && screen_off_mode == ScreenOffMode::Awake) {
+          if (!observed_input_this_frame && screen_off_mode == ScreenOffMode::Awake &&
+              !rgds_plus_lid_requested && !rgds_plus_auto_requested) {
             flush_deferred_writes(false);
             app_shell.ResetFrameClock(prev_ticks);
             continue;
@@ -2341,7 +2371,8 @@ int RunApp(int argc, char **argv) {
             if (screen_off_mode == ScreenOffMode::Awake) last_user_input_tick = SDL_GetTicks();
             input_end_frame_done = true;
           }
-          if (!observed_input_this_frame && screen_off_mode == ScreenOffMode::Awake) {
+          if (!observed_input_this_frame && screen_off_mode == ScreenOffMode::Awake &&
+              !rgds_plus_lid_requested && !rgds_plus_auto_requested) {
             app_shell.ResetFrameClock(prev_ticks);
             continue;
           }
@@ -2369,6 +2400,33 @@ int RunApp(int argc, char **argv) {
       input_wake_next_resync_tick = 0;
     }
     const bool power_input_allowed = SDL_TICKS_PASSED(power_now, power_key_ignore_until_tick);
+
+    if (is_rgds_plus &&
+        (rgds_plus_lid_requested ||
+         (rgds_plus_auto_requested && !observed_input_this_frame && !input.AnyPressed()) ||
+         (!key_calibration_capturing_before_power && power_input_allowed &&
+          input.IsJustPressed(Button::Power)))) {
+      runtime_log::Line(std::string("main: RGDS plus suspend requested reason=") +
+                        (rgds_plus_lid_requested ? "lid" : rgds_plus_auto_requested ? "auto" : "power"));
+      persist_active_reader_progress();
+      flush_deferred_writes(true);
+      const bool resumed = lid_power_controller.SuspendRgdsPlus(rgds_plus_lid_requested);
+      last_user_input_tick = SDL_GetTicks();
+      rgds_plus_lid.SuspendCompleted(resumed, last_user_input_tick);
+      power_key_ignore_until_tick = last_user_input_tick + 900;
+      if (resumed) {
+        // The blocking kernel call has already resumed. Do not enter the legacy
+        // RGDS screen-off state or run another sleep script on the wake event.
+        resync_input_after_screen_wake();
+        invalidate_all_render_cache();
+      } else {
+        input.SuppressPowerUntilRelease();
+      }
+      runtime_log::Line(std::string("main: RGDS plus suspend ") +
+                        (resumed ? "resumed" : "failed or cancelled"));
+      input.ResetAll();
+      app_shell.ResetFrameClock(prev_ticks);
+    }
 
     if (is_rgds_runtime && rgds_display_sleep_active) {
       if (power_input_allowed && input.IsJustPressed(Button::Power)) {
@@ -2455,7 +2513,8 @@ int RunApp(int argc, char **argv) {
       continue;
     }
 
-    if (!key_calibration_capturing_before_power && power_input_allowed && input.IsJustPressed(Button::Power)) {
+    if (!is_rgds_plus && !key_calibration_capturing_before_power &&
+        power_input_allowed && input.IsJustPressed(Button::Power)) {
       if (lid_power_controller.TriggerPowerKeyScreenOff(input_profile)) {
         if (input_profile == InputProfile::RGDS) {
           rgds_display_sleep_active = true;
@@ -2755,10 +2814,10 @@ int RunApp(int argc, char **argv) {
             const rgds::ReaderLayout pre_tick_layout =
                 rgds::ResolveReaderLayout(reader_mode, rgds_active_reader_module, pre_tick_progress.rotation);
             rgds_active_reader_module->UpdateViewport(pre_tick_layout.mode == rgds::ReaderLayoutMode::HorizontalSpread
-                                                          ? rgds::kScreenW
+                                                          ? rgds::ScreenW()
                                                           : pre_tick_layout.canvas_w,
                                                       pre_tick_layout.mode == rgds::ReaderLayoutMode::HorizontalSpread
-                                                          ? rgds::kScreenH
+                                                          ? rgds::ScreenH()
                                                           : pre_tick_layout.canvas_h);
             rgds_active_reader_module->Tick(dt);
           }

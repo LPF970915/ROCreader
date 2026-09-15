@@ -36,8 +36,10 @@ bool TxtReaderModule::IsOpen() const {
 }
 
 void TxtReaderModule::UpdateViewport(int w, int h) {
-  ui_.Txt().viewport_w = w;
-  ui_.Txt().viewport_h = h;
+  // The TXT session owns the inset content bounds and their cached wrapping.
+  // Generic reader updates supply full canvas dimensions, not content bounds.
+  (void)w;
+  (void)h;
 }
 
 void TxtReaderModule::Tick(float dt) {

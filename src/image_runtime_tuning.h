@@ -20,7 +20,7 @@ inline bool RgdsFastMode() {
   static const bool enabled = [] {
     if (EnvEnabled("ROCREADER_IMAGE_FAST_MODE")) return true;
     const char *device = std::getenv("ROCREADER_DEVICE_MODEL");
-    return EqualsToken(device, "rgds");
+    return EqualsToken(device, "rgds") || EqualsToken(device, "rgds-plus");
   }();
   return enabled;
 }

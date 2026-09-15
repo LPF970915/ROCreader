@@ -27,7 +27,7 @@ AppPlatformEnv ResolveAppPlatformEnv(const std::string &device_model_token,
       device_model_token == "trimui-brick" || screen_profile.profile_name == "1024x768";
   const bool use_gkd350h_ultra_keymap = UsesGKD350HUltraKeymap(device_model_token, screen_profile);
   env.capabilities.input_profile =
-      device_model_token == "rgds"
+      rgds::IsRgdsModelToken(device_model_token)
           ? InputProfile::RGDS
           : use_gkd350h_ultra_keymap
           ? InputProfile::GKD350HUltra

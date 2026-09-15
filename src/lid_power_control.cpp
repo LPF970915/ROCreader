@@ -247,3 +247,56 @@ bool LidPowerController::TriggerScreenOn(InputProfile input_profile) const {
 }
 
 std::string LidPowerController::PowerScriptPath() const { return power_script_path_.string(); }
+
+bool LidPowerController::SuspendRgdsPlus(bool lid_closed) const {
+  if (!ScriptAvailable() || (lid_closed && !enabled_)) return false;
+  return RunPowerScriptArg(power_script_path_, lid_closed ? "lid" : "suspend");
+}
+
+bool RgdsPlusLidMonitor::Poll(uint32_t now, bool enabled) {
+  if (!enabled) return Observe(-1, now, false);
+  if (polled_ && now - last_poll_ < 100) return false;
+  polled_ = true;
+  last_poll_ = now;
+  std::ifstream in(EnvOrDefault("ROCREADER_RGDS_HALL_PATH",
+                               "/sys/class/anbernic_misc/hallkey"));
+  int value = -1;
+  if (!(in >> value)) value = -1;
+  in >> std::ws;
+  if (!in.eof()) value = -1;
+  return Observe(value, now, true);
+}
+
+bool RgdsPlusLidMonitor::Observe(int hall_value, uint32_t now, bool enabled) {
+  if (!enabled) {
+    close_pending_ = false;
+    close_handled_ = false;
+    polled_ = false;
+    return false;
+  }
+  if (hall_value < 0 || hall_value > 3) {
+    close_pending_ = false;
+    return false;
+  }
+  // Firmware dmenu uses bit 0 (0 = closed), not the entire two-bit value.
+  if ((hall_value & 1) != 0) {
+    close_pending_ = false;
+    close_handled_ = false;
+    return false;
+  }
+  if (close_handled_) return false;
+  if (!close_pending_) {
+    close_pending_ = true;
+    closed_since_ = now;
+  }
+  if (now - closed_since_ < 3000) return false;
+  close_handled_ = true;
+  return true;
+}
+
+void RgdsPlusLidMonitor::SuspendCompleted(bool success, uint32_t now) {
+  // An RTC/power-key wake while still closed must not immediately suspend again.
+  close_handled_ = success;
+  close_pending_ = !success;
+  closed_since_ = now;
+}

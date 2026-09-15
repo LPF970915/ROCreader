@@ -51,6 +51,9 @@ RGDS/dist/
 RGDS/dist_official/
 RGDS/*.log
 RGDS/.rgds_*_files/
+RGDSPlus/Downloads/
+RGDSPlus/dist_official/
+RGDSPlus/toolchain/
 
 !Downloads/
 !Downloads/**

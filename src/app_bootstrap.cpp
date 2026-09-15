@@ -91,6 +91,7 @@ AppBootstrapResult BootstrapSdlApp() {
 
   runtime_log::Line("main: DetectScreenProfile begin");
   result.screen_profile = DetectScreenProfile();
+  rgds::ConfigureScreenMetrics(result.screen_profile.screen_w, result.screen_profile.screen_h);
   result.verbose_log = VerboseLogEnabled();
 
   uint32_t win_flags = SDL_WINDOW_SHOWN;

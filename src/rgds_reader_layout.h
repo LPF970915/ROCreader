@@ -8,9 +8,6 @@
 
 namespace rgds {
 
-constexpr int kSpreadReaderW = kScreenW * 2;
-constexpr int kSpreadReaderH = kScreenH;
-
 enum class ReaderLayoutMode {
   VerticalStack,
   HorizontalSpread,

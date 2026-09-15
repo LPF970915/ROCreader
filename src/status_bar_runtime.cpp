@@ -19,29 +19,33 @@ void DrawStatusBarRuntime(const StatusBarRenderDeps &deps) {
   auto scale_px = [&](int value) { return deps.scale_px ? deps.scale_px(value) : value; };
 
   const int center_y = deps.top_bar_y + deps.top_bar_h / 2;
-  const bool trimui_brick_status_layout = deps.input_profile == InputProfile::TrimuiBrick;
+  // RGDS plus shares Brick's layout, but keeps the RGDS input profile.
+  const bool status_layout_1024 = deps.input_profile == InputProfile::TrimuiBrick ||
+                                 (deps.input_profile == InputProfile::RGDS && deps.screen_w == 1024);
   const bool gkd350h_ultra_status_layout = deps.input_profile == InputProfile::GKD350HUltra;
   const int base_screen_w = 720;
-  const int extra_status_x = trimui_brick_status_layout ? 0 : std::max(0, deps.screen_w - scale_px(base_screen_w));
+  const int extra_status_x = status_layout_1024 ? 0 : std::max(0, deps.screen_w - scale_px(base_screen_w));
   auto status_x = [&](int base_x) { return scale_px(base_x) + extra_status_x; };
-  const int battery_shift_y = trimui_brick_status_layout ? 5 : (gkd350h_ultra_status_layout ? 0 : scale_px(3));
+  const int battery_shift_y = status_layout_1024 ? 5 : (gkd350h_ultra_status_layout ? 0 : scale_px(3));
   const int h700_battery_shift_x = (deps.screen_w <= 640) ? -80 : 0;
-  const int battery_icon_x = trimui_brick_status_layout ? 750
+  const int battery_icon_x = status_layout_1024 ? 750
                              : gkd350h_ultra_status_layout ? 1249
                                                           : status_x(552 + h700_battery_shift_x);
-  const int battery_text_x = trimui_brick_status_layout ? 806
+  const int preferred_battery_text_x = status_layout_1024 ? 806
                              : gkd350h_ultra_status_layout ? 1308
                                                           : status_x(587 + h700_battery_shift_x);
-  const int clock_shift_x = trimui_brick_status_layout ? 64 : 40;
-  const int clock_shift_y = trimui_brick_status_layout ? 5 : (gkd350h_ultra_status_layout ? 0 : scale_px(3));
-  int clock_right = trimui_brick_status_layout ? deps.screen_w - 26 - clock_shift_x
+  const int clock_shift_x = status_layout_1024 ? 64 : 40;
+  const int clock_shift_y = status_layout_1024 ? 5 : (gkd350h_ultra_status_layout ? 0 : scale_px(3));
+  int clock_right = status_layout_1024 ? deps.screen_w - 26 - clock_shift_x
                     : gkd350h_ultra_status_layout ? 1468
                                                  : deps.screen_w - 16 - clock_shift_x;
+  int clock_left = clock_right;
 
   if (!status.clock_text.empty()) {
     TextCacheEntry *clock_tex = deps.get_text_texture ? deps.get_text_texture(status.clock_text, text_color) : nullptr;
     if (clock_tex && clock_tex->texture) {
       const int clock_x = clock_right - clock_tex->w;
+      clock_left = clock_x;
       const int clock_y = center_y - clock_tex->h / 2 + clock_shift_y;
       SDL_Rect td{clock_x, clock_y, clock_tex->w, clock_tex->h};
       SDL_RenderCopy(deps.renderer, clock_tex->texture, nullptr, &td);
@@ -74,7 +78,14 @@ void DrawStatusBarRuntime(const StatusBarRenderDeps &deps) {
     const int cap_h = gkd350h_ultra_status_layout ? 10 : scale_px(8);
     const int body_w = gkd350h_ultra_status_layout ? 47 : scale_px(24);
     const int body_h = gkd350h_ultra_status_layout ? 29 : scale_px(12);
-    const int icon_x = battery_icon_x;
+    // Keep full battery percentages clear of the clock with either bundled font.
+    const int status_gap = scale_px(6);
+    const int battery_text_x = status_layout_1024
+                                   ? std::min(preferred_battery_text_x, clock_left - status_gap - battery_text_w)
+                                   : preferred_battery_text_x;
+    const int icon_x = status_layout_1024
+                           ? std::min(battery_icon_x, battery_text_x - status_gap - body_w - cap_w)
+                           : battery_icon_x;
     const int icon_y = gkd350h_ultra_status_layout ? 26 : center_y - body_h / 2 + battery_shift_y;
 
     if (deps.draw_rect) {

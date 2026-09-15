@@ -28,7 +28,7 @@ struct TxtSessionFacadeDeps {
   size_t txt_max_bytes = 0;
   size_t txt_max_wrapped_lines = 0;
   uint32_t txt_resume_save_delay_ms = 0;
-  int txt_layout_cache_version = 0;
+  int txt_layout_cache_version = kTxtLayoutCacheVersion;
 };
 
 class TxtSessionFacade {

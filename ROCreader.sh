@@ -152,6 +152,14 @@ screen_profile_from_board_ini() {
       printf '1024x768|%s\n' "$model_name"
       return 0
       ;;
+    *rgds*plus*|*rgds+*)
+      printf '1024x768|%s\n' "$model_name"
+      return 0
+      ;;
+    *rgds*)
+      printf '640x480|%s\n' "$model_name"
+      return 0
+      ;;
     *rgcubexx*|*cubexx*)
       printf '720x720|%s\n' "$model_name"
       return 0
@@ -175,7 +183,7 @@ normalize_screen_override() {
       export ROCREADER_SCREEN_W=1600
       export ROCREADER_SCREEN_H=1440
       ;;
-    1024x768|brick|trimui-brick)
+    1024x768|brick|trimui-brick|rgds-plus|rgdsplus)
       export ROCREADER_SCREEN_W=1024
       export ROCREADER_SCREEN_H=768
       ;;

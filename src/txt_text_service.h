@@ -14,6 +14,9 @@
 #include <unordered_map>
 #include <vector>
 
+// Discard layouts/resume caches wrapped with canvas dimensions instead of content bounds.
+constexpr int kTxtLayoutCacheVersion = 7;
+
 struct TxtTextServiceState {
   std::unordered_map<std::string, TxtLayoutCacheEntry> layout_cache;
   std::filesystem::path cache_dir;

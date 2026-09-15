@@ -18,6 +18,18 @@ constexpr int kVirtualReaderH = 960;
 constexpr int kReaderCanvasMaxW = 1280;
 constexpr int kReaderCanvasMaxH = 960;
 
+// RGDS and RGDS plus share the runtime, but use different physical panel sizes.
+// Keep the historical 640x480 constants as defaults for existing RGDS builds and
+// resolve the active metrics from the detected screen profile at startup.
+int ScreenW();
+int ScreenH();
+int VirtualReaderW();
+int VirtualReaderH();
+int ReaderCanvasMaxW();
+int ReaderCanvasMaxH();
+void ConfigureScreenMetrics(int screen_w, int screen_h);
+bool IsRgdsModelToken(const std::string &device_model_token);
+
 struct PlatformConfig {
   bool is_model = false;
   bool dual_screen_requested = false;

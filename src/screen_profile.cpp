@@ -78,7 +78,8 @@ bool ReadEnvScreenProfile(int &out_w, int &out_h) {
     out_h = gkd350h_ultra::kScreenH;
     return true;
   }
-  if (profile == "1024x768" || profile == "brick" || profile == "trimui-brick") {
+  if (profile == "1024x768" || profile == "brick" || profile == "trimui-brick" || profile == "rgds-plus" ||
+      profile == "rgdsplus") {
     out_w = 1024;
     out_h = 768;
     return true;
@@ -124,7 +125,8 @@ bool ReadConfigScreenProfile(int &out_w, int &out_h) {
         out_h = gkd350h_ultra::kScreenH;
         return true;
       }
-      if (value == "1024x768" || value == "brick" || value == "trimui-brick") {
+      if (value == "1024x768" || value == "brick" || value == "trimui-brick" || value == "rgds-plus" ||
+          value == "rgdsplus") {
         out_w = 1024;
         out_h = 768;
         return true;
@@ -151,6 +153,8 @@ bool ReadConfigScreenProfile(int &out_w, int &out_h) {
 
 std::string CanonicalModelTokenFromText(const std::string &text) {
   if (text.empty()) return {};
+  const std::string lower = ToLowerAscii(text);
+  if (lower.find("rgds+") != std::string::npos) return "rgds-plus";
   const std::string compact = CompactAsciiAlnum(text);
   if (compact.empty()) return {};
 
@@ -162,6 +166,8 @@ std::string CanonicalModelTokenFromText(const std::string &text) {
       {"trimuibrick", "trimui-brick"},
       {"brick", "trimui-brick"},
       {"tg3040", "trimui-brick"},
+      {"rgdsplus", "rgds-plus"},
+      {"rgds", "rgds"},
       {"rg34xxsp", "rg34xx-sp"},
       {"34xxsp", "rg34xx-sp"},
       {"rg35xxplus", "rg35xx-plus"},
@@ -207,6 +213,16 @@ bool ApplyProfileFromModelToken(const std::string &model_token, int &out_w, int 
   if (model_token == "trimui-brick") {
     out_w = 1024;
     out_h = 768;
+    return true;
+  }
+  if (model_token == "rgds-plus") {
+    out_w = 1024;
+    out_h = 768;
+    return true;
+  }
+  if (model_token == "rgds") {
+    out_w = 640;
+    out_h = 480;
     return true;
   }
   if (model_token == "rgcubexx") {

@@ -24,12 +24,19 @@ bool IsHorizontalSpreadRotation(int rotation) {
 
 ReaderLayout ResolveReaderLayout(ReaderMode mode, const IReaderModule *module, int rotation) {
   ReaderLayout layout;
+  const int screen_w = ScreenW();
+  const int screen_h = ScreenH();
+  layout.canvas_w = VirtualReaderW();
+  layout.canvas_h = VirtualReaderH();
+  layout.top_src = SDL_Rect{0, 0, screen_w, screen_h};
+  layout.bottom_src = SDL_Rect{0, screen_h, screen_w, screen_h};
+  layout.overlay_viewport = layout.bottom_src;
   if (IsImageReaderMode(mode, module) && IsHorizontalSpreadRotation(rotation)) {
     layout.mode = ReaderLayoutMode::HorizontalSpread;
-    layout.canvas_w = kSpreadReaderW;
-    layout.canvas_h = kSpreadReaderH;
-    layout.top_src = SDL_Rect{0, 0, kScreenW, kScreenH};
-    layout.bottom_src = SDL_Rect{kScreenW, 0, kScreenW, kScreenH};
+    layout.canvas_w = screen_w * 2;
+    layout.canvas_h = screen_h;
+    layout.top_src = SDL_Rect{0, 0, screen_w, screen_h};
+    layout.bottom_src = SDL_Rect{screen_w, 0, screen_w, screen_h};
     layout.overlay_viewport = layout.bottom_src;
   }
   return layout;

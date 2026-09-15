@@ -12,6 +12,9 @@
 
 namespace rgds {
 namespace {
+int g_screen_w = kScreenW;
+int g_screen_h = kScreenH;
+
 SDL_Rect ValidDisplayBoundsOrFallback(int display_index, SDL_Rect fallback) {
   SDL_Rect bounds = fallback;
   if (SDL_GetDisplayBounds(display_index, &bounds) != 0 || bounds.w <= 0 || bounds.h <= 0) {
@@ -35,9 +38,26 @@ std::string RectText(SDL_Rect rect) {
 }
 } // namespace
 
+int ScreenW() { return g_screen_w; }
+int ScreenH() { return g_screen_h; }
+int VirtualReaderW() { return g_screen_w; }
+int VirtualReaderH() { return g_screen_h * 2; }
+int ReaderCanvasMaxW() { return g_screen_w * 2; }
+int ReaderCanvasMaxH() { return g_screen_h * 2; }
+
+void ConfigureScreenMetrics(int screen_w, int screen_h) {
+  if (screen_w <= 0 || screen_h <= 0) return;
+  g_screen_w = screen_w;
+  g_screen_h = screen_h;
+}
+
+bool IsRgdsModelToken(const std::string &device_model_token) {
+  return device_model_token == "rgds" || device_model_token == "rgds-plus";
+}
+
 PlatformConfig DetectPlatformConfig(const std::string &device_model_token) {
   PlatformConfig config;
-  config.is_model = device_model_token == "rgds";
+  config.is_model = IsRgdsModelToken(device_model_token);
   config.dual_screen_requested = config.is_model;
   config.stacked_preview = false;
   config.spanning = config.is_model;
@@ -52,19 +72,19 @@ uint32_t ApplyWindowFlags(uint32_t current_flags, const PlatformConfig &config) 
 }
 
 void ProbeDisplayBounds(Runtime &runtime, const PlatformConfig &config, const LayoutMetrics &layout, bool verbose_log) {
-  runtime.top_bounds = SDL_Rect{0, 0, layout.screen_w, layout.screen_h};
-  runtime.bottom_bounds = SDL_Rect{layout.screen_w, 0, layout.screen_w, layout.screen_h};
+  runtime.top_bounds = SDL_Rect{0, 0, ScreenW(), ScreenH()};
+  runtime.bottom_bounds = SDL_Rect{ScreenW(), 0, ScreenW(), ScreenH()};
   if (!config.dual_screen_requested) return;
   if (config.stacked_preview) {
-    runtime.top_bounds = SDL_Rect{0, 0, kScreenW, kVirtualReaderH};
-    runtime.bottom_bounds = SDL_Rect{0, kScreenH, kScreenW, kScreenH};
+    runtime.top_bounds = SDL_Rect{0, 0, ScreenW(), VirtualReaderH()};
+    runtime.bottom_bounds = SDL_Rect{0, ScreenH(), ScreenW(), ScreenH()};
     runtime.stacked_preview = true;
     runtime_log::Line("main: RGDS stacked preview route enabled");
     return;
   }
 
-  runtime.top_bounds = ValidDisplayBoundsOrFallback(0, SDL_Rect{0, 0, kScreenW, kScreenH});
-  runtime.bottom_bounds = ValidDisplayBoundsOrFallback(1, SDL_Rect{kScreenW, 0, kScreenW, kScreenH});
+  runtime.top_bounds = ValidDisplayBoundsOrFallback(0, SDL_Rect{0, 0, ScreenW(), ScreenH()});
+  runtime.bottom_bounds = ValidDisplayBoundsOrFallback(1, SDL_Rect{ScreenW(), 0, ScreenW(), ScreenH()});
   runtime.spanning = config.spanning;
   if (config.spanning) {
     runtime.dual_screen_active = true;
@@ -105,16 +125,16 @@ int TopWindowY(const Runtime &runtime, const PlatformConfig &config) {
 
 int TopWindowW(const Runtime &runtime, const PlatformConfig &config, const LayoutMetrics &layout) {
   if (config.spanning) {
-    return std::max(kScreenW * 2, UnionRect(runtime.top_bounds, runtime.bottom_bounds).w);
+    return std::max(ScreenW() * 2, UnionRect(runtime.top_bounds, runtime.bottom_bounds).w);
   }
-  return config.stacked_preview ? kScreenW : layout.screen_w;
+  return config.stacked_preview ? ScreenW() : layout.screen_w;
 }
 
 int TopWindowH(const Runtime &runtime, const PlatformConfig &config, const LayoutMetrics &layout) {
   if (config.spanning) {
-    return std::max(kScreenH, UnionRect(runtime.top_bounds, runtime.bottom_bounds).h);
+    return std::max(ScreenH(), UnionRect(runtime.top_bounds, runtime.bottom_bounds).h);
   }
-  return config.stacked_preview ? kVirtualReaderH : layout.screen_h;
+  return config.stacked_preview ? VirtualReaderH() : layout.screen_h;
 }
 
 void ConfigureMainWindow(Runtime &runtime, const PlatformConfig &config, SDL_Window *window, bool verbose_log) {
@@ -122,7 +142,7 @@ void ConfigureMainWindow(Runtime &runtime, const PlatformConfig &config, SDL_Win
   const SDL_Rect spanning_bounds = UnionRect(runtime.top_bounds, runtime.bottom_bounds);
   SDL_SetWindowBordered(window, SDL_FALSE);
   SDL_SetWindowPosition(window, spanning_bounds.x, spanning_bounds.y);
-  SDL_SetWindowSize(window, std::max(kScreenW * 2, spanning_bounds.w), std::max(kScreenH, spanning_bounds.h));
+  SDL_SetWindowSize(window, std::max(ScreenW() * 2, spanning_bounds.w), std::max(ScreenH(), spanning_bounds.h));
   SDL_RaiseWindow(window);
 
   int actual_x = 0;
@@ -219,7 +239,7 @@ void CreateReaderCanvas(Runtime &runtime, SDL_Renderer *top_renderer, bool top_r
   runtime.reader_canvas_content_h = 0;
   runtime.reader_canvas_content_valid = false;
   runtime.reader_canvas = SDL_CreateTexture(top_renderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET,
-                                            kReaderCanvasMaxW, kReaderCanvasMaxH);
+                                            ReaderCanvasMaxW(), ReaderCanvasMaxH());
   if (runtime.reader_canvas) {
     SDL_SetTextureBlendMode(runtime.reader_canvas, SDL_BLENDMODE_BLEND);
     runtime_log::Line("main: RGDS reader canvas ready");
@@ -229,7 +249,7 @@ void CreateReaderCanvas(Runtime &runtime, SDL_Renderer *top_renderer, bool top_r
   if (!runtime.stacked_preview && runtime.bottom_renderer) {
     const Uint32 access = runtime.spanning ? SDL_TEXTUREACCESS_TARGET : SDL_TEXTUREACCESS_STREAMING;
     runtime.bottom_reader_canvas =
-        SDL_CreateTexture(runtime.bottom_renderer, SDL_PIXELFORMAT_RGBA8888, access, kReaderCanvasMaxW, kReaderCanvasMaxH);
+        SDL_CreateTexture(runtime.bottom_renderer, SDL_PIXELFORMAT_RGBA8888, access, ReaderCanvasMaxW(), ReaderCanvasMaxH());
     if (runtime.bottom_reader_canvas) {
       SDL_SetTextureBlendMode(runtime.bottom_reader_canvas, SDL_BLENDMODE_BLEND);
       runtime_log::Line("main: RGDS bottom reader canvas ready");

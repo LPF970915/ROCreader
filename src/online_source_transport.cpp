@@ -345,7 +345,7 @@ bool RunningOnRgdsRuntime() {
   std::string model = device;
   std::transform(model.begin(), model.end(), model.begin(),
                  [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-  return model == "rgds";
+  return model == "rgds" || model == "rgds-plus";
 }
 
 #if !defined(_WIN32)

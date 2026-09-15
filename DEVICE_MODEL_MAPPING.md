@@ -80,6 +80,18 @@ Rules:
 | --- | --- | --- | --- | --- |
 | `gkd350h-ultra` | `GKD350H Ultra` | `gkd350hultra`, `gkd350h`, `gkd350h-ultra`, `gkd ultra`, `gkd_atom`, `gamekiddy gkd atom` | `1600x1440` | `GKD350HUltra` |
 
+### RK3568
+
+Rules:
+
+- RGDS uses two `640x480` panels with the RGDS dual-screen runtime.
+- RGDS plus uses two `1024x768` panels with the same RGDS dual-screen runtime and input mapping.
+
+| Canonical model | Display name | Accepted aliases | Resolution | Input mapping |
+| --- | --- | --- | --- | --- |
+| `rgds` | `RGDS` | `rgds` | `640x480` per panel | `RGDS` |
+| `rgds-plus` | `RGDS plus` | `rgdsplus`, `rgds+`, `rgds plus`, `rgds-plus` | `1024x768` per panel | `RGDS` |
+
 ## Matching Guidance
 
 - Do not make runtime matching depend on canonical names being present in raw
