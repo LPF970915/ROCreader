@@ -80,7 +80,13 @@ version_is_newer() {
 find_pending_marker() {
   for root in /mnt/mmc /mnt/sdcard /mnt/SDCARD "$APP_DIR"; do
     marker="$root/Downloads/ROCreader_update_pending.txt"
-    [ -f "$marker" ] && { printf '%s' "$marker"; return 0; }
+    if [ -f "$marker" ]; then
+      package_name="$(extract_marker_value filename "$marker")"
+      case "$package_name" in */*|*\\*) continue ;; esac
+      [ -n "$(extract_version_from_name "$package_name")" ] || continue
+      printf '%s' "$marker"
+      return 0
+    fi
   done
   return 1
 }
@@ -125,8 +131,22 @@ replace_runtime_entry() {
   src="$2/$name"
   dst="$APP_DIR/$name"
   [ -e "$src" ] || return 0
-  rm -rf "$dst"
-  cp -a "$src" "$APP_DIR/"
+  incoming="$dst.update-new"
+  previous="$dst.update-old"
+  rm -rf "$incoming" || return 1
+  if ! cp -a "$src" "$incoming"; then
+    rm -rf "$incoming"
+    return 1
+  fi
+  rm -rf "$previous" || return 1
+  if [ -e "$dst" ] && ! mv "$dst" "$previous"; then
+    return 1
+  fi
+  if ! mv "$incoming" "$dst"; then
+    [ ! -e "$previous" ] || mv "$previous" "$dst"
+    return 1
+  fi
+  rm -rf "$previous"
 }
 
 find_staged_runtime_dir() {
@@ -141,11 +161,13 @@ find_staged_runtime_dir() {
 }
 
 clear_pending_update_markers() {
-  rm -f \
-    /mnt/mmc/Downloads/ROCreader_update_pending.txt \
-    /mnt/sdcard/Downloads/ROCreader_update_pending.txt \
-    /mnt/SDCARD/Downloads/ROCreader_update_pending.txt \
-    "$APP_DIR/Downloads/ROCreader_update_pending.txt" 2>/dev/null || true
+  for root in /mnt/mmc /mnt/sdcard /mnt/SDCARD "$APP_DIR"; do
+    marker_file="$root/Downloads/ROCreader_update_pending.txt"
+    [ -f "$marker_file" ] || continue
+    marker_name="$(extract_marker_value filename "$marker_file")"
+    [ -n "$(extract_version_from_name "$marker_name")" ] || continue
+    rm -f "$marker_file" 2>/dev/null || true
+  done
 }
 
 perform_pending_update_if_any() {
@@ -195,29 +217,39 @@ perform_pending_update_if_any() {
     return 1
   fi
   staged_runtime="$(find_staged_runtime_dir "$UPDATE_STAGE_DIR" || true)"
-  if [ ! -d "$staged_runtime" ]; then
+  if [ ! -f "$staged_runtime/rocreader_sdl" ]; then
     log "[update] staged runtime missing under: $UPDATE_STAGE_DIR"
     write_update_status "failed" "$package_version"
     rm -rf "$UPDATE_STAGE_DIR"
     return 1
   fi
-  [ -n "$package_version" ] || package_version="$(sed -n '1p' "$staged_runtime/version.txt" 2>/dev/null || true)"
-
-  replace_runtime_entry "rocreader_sdl" "$staged_runtime"
-  replace_runtime_entry "ui.pack" "$staged_runtime"
-  replace_runtime_entry "fonts" "$staged_runtime"
-  replace_runtime_entry "sounds" "$staged_runtime"
-  replace_runtime_entry "lib" "$staged_runtime"
-  replace_runtime_entry "lib_system_sdl" "$staged_runtime"
-  replace_runtime_entry "rgds_power_control.sh" "$staged_runtime"
-  [ -n "$package_version" ] && printf '%s\n' "$package_version" > "$APP_DIR/version.txt"
+  staged_version="$(sed -n '1p' "$staged_runtime/version.txt" 2>/dev/null || true)"
+  if [ -z "$staged_version" ] || [ "$staged_version" != "$package_version" ]; then
+    log "[update] package version mismatch"
+    write_update_status "failed" "$package_version"
+    return 1
+  fi
+  for entry in rocreader_sdl ui.pack fonts sounds lib lib_system_sdl rgds_power_control.sh; do
+    if ! replace_runtime_entry "$entry" "$staged_runtime"; then
+      log "[update] failed to install $entry"
+      write_update_status "failed" "$package_version"
+      return 1
+    fi
+  done
 
   staged_launcher="$UPDATE_STAGE_DIR/Roms/APPS/ROCreader_RGDSPlus.sh"
   if [ -f "$staged_launcher" ]; then
-    cp "$staged_launcher" "$LAUNCHER_PATH.new"
-    mv "$LAUNCHER_PATH.new" "$LAUNCHER_PATH"
+    if ! cp "$staged_launcher" "$LAUNCHER_PATH.new" ||
+       ! mv "$LAUNCHER_PATH.new" "$LAUNCHER_PATH"; then
+      write_update_status "failed" "$package_version"
+      return 1
+    fi
   fi
 
+  if ! printf '%s\n' "$package_version" > "$APP_DIR/version.txt"; then
+    write_update_status "failed" "$package_version"
+    return 1
+  fi
   chmod +x "$APP_DIR/rocreader_sdl" "$APP_DIR/rgds_power_control.sh" "$LAUNCHER_PATH" 2>/dev/null || true
   clear_pending_update_markers
   rm -f "$package_path" 2>/dev/null || true

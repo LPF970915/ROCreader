@@ -25,6 +25,8 @@ constexpr const char *kGithubContentsApi =
     "https://api.github.com/repos/LPF970915/ROCreader/contents/Downloads?ref=main";
 constexpr const char *kGkdGithubContentsApi =
     "https://api.github.com/repos/LPF970915/ROCreader/contents/GKD350HUltra/Downloads?ref=main";
+constexpr const char *kRgdsPlusGithubContentsApi =
+    "https://api.github.com/repos/LPF970915/ROCreader/contents/RGDSPlus/Downloads?ref=main";
 constexpr const char *kUpdateContentsUrlEnv = "ROCREADER_UPDATE_CONTENTS_URL";
 constexpr const char *kPendingMarkerFilename = "ROCreader_update_pending.txt";
 constexpr const char *kUserAgent = "ROCreader-Updater";
@@ -80,9 +82,15 @@ std::string ToLowerAscii(std::string text) {
   return text;
 }
 
+bool IsRgdsPlusUpdateProfile(InputProfile input_profile) {
+  const char *model = std::getenv("ROCREADER_DEVICE_MODEL");
+  return input_profile == InputProfile::RGDS && model && ToLowerAscii(model) == "rgds-plus";
+}
+
 std::string ResolveGithubContentsUrl(InputProfile input_profile) {
   const char *env_url = std::getenv(kUpdateContentsUrlEnv);
   if (!env_url || !*env_url) {
+    if (IsRgdsPlusUpdateProfile(input_profile)) return kRgdsPlusGithubContentsApi;
     return input_profile == InputProfile::GKD350HUltra ? kGkdGithubContentsApi : kGithubContentsApi;
   }
 
@@ -509,6 +517,11 @@ struct RemoteArchiveInfo {
 
 bool IsPackageForProfile(const std::string &filename, InputProfile input_profile) {
   const std::string lower = ToLowerAscii(filename);
+  const std::string plus_suffix = " for rgds plus.zip";
+  const bool is_plus = lower.size() >= plus_suffix.size() &&
+                      lower.compare(lower.size() - plus_suffix.size(), plus_suffix.size(), plus_suffix) == 0;
+  if (IsRgdsPlusUpdateProfile(input_profile)) return is_plus;
+  if (is_plus) return false;
   if (input_profile == InputProfile::GKD350HUltra) {
     return lower.find("gkd350h ultra") != std::string::npos ||
            lower.find("gkd350hultra") != std::string::npos;
@@ -517,12 +530,7 @@ bool IsPackageForProfile(const std::string &filename, InputProfile input_profile
          lower.find("gkd350hultra") == std::string::npos;
 }
 
-bool FetchLatestRemoteArchive(RemoteArchiveInfo &out_info, InputProfile input_profile) {
-  const std::string contents_url = ResolveGithubContentsUrl(input_profile);
-  const std::string json = HttpGetText(contents_url);
-  AppendUpdateLog("Fetched GitHub contents metadata url=" + contents_url + " bytes=" + std::to_string(json.size()));
-  if (json.empty()) return false;
-
+bool SelectLatestRemoteArchive(const std::string &json, RemoteArchiveInfo &out_info, InputProfile input_profile) {
   size_t search_pos = 0;
   bool found = false;
   RemoteArchiveInfo best{};
@@ -559,6 +567,13 @@ bool FetchLatestRemoteArchive(RemoteArchiveInfo &out_info, InputProfile input_pr
                   + " bytes=" + std::to_string(best.size_bytes));
   out_info = std::move(best);
   return true;
+}
+
+bool FetchLatestRemoteArchive(RemoteArchiveInfo &out_info, InputProfile input_profile) {
+  const std::string contents_url = ResolveGithubContentsUrl(input_profile);
+  const std::string json = HttpGetText(contents_url);
+  AppendUpdateLog("Fetched GitHub contents metadata url=" + contents_url + " bytes=" + std::to_string(json.size()));
+  return SelectLatestRemoteArchive(json, out_info, input_profile);
 }
 
 std::filesystem::path DetectDownloadRoot() {
@@ -601,7 +616,7 @@ bool IsTrimuiBrickPackageName(const std::string &filename) {
 }
 
 void ClearInstalledPendingArtifacts(const std::filesystem::path &downloads_dir,
-                                    const std::string &installed_version) {
+                                    const std::string &installed_version, InputProfile input_profile) {
   if (downloads_dir.empty() || installed_version.empty()) return;
   std::error_code ec;
   if (!std::filesystem::exists(downloads_dir, ec) || ec || !std::filesystem::is_directory(downloads_dir, ec)) {
@@ -627,6 +642,8 @@ void ClearInstalledPendingArtifacts(const std::filesystem::path &downloads_dir,
     TryExtractVersionToken(marker_package_path.filename().string(), marker_version);
   }
   if (!marker_package_path.empty() &&
+      (!IsRgdsPlusUpdateProfile(input_profile) ||
+       IsPackageForProfile(marker_package_path.filename().string(), input_profile)) &&
       (marker_version.empty() || !IsVersionNewer(marker_version, installed_version))) {
     AppendUpdateLog("Clearing stale pending marker for installed version " + installed_version);
     RemovePendingMarkerAndInstalledPackage(marker_path, marker_package_path);
@@ -642,7 +659,12 @@ void ClearInstalledPendingArtifacts(const std::filesystem::path &downloads_dir,
       continue;
     }
     const std::string filename = it->path().filename().string();
-    if (!IsTrimuiBrickPackageName(filename) && !IsPackageForProfile(filename, InputProfile::GKD350HUltra)) continue;
+    if (IsRgdsPlusUpdateProfile(input_profile)) {
+      if (!IsPackageForProfile(filename, input_profile)) continue;
+    } else if (!IsTrimuiBrickPackageName(filename) &&
+               !IsPackageForProfile(filename, InputProfile::GKD350HUltra)) {
+      continue;
+    }
     std::string version;
     if (!TryExtractVersionToken(filename, version)) continue;
     if (!IsVersionNewer(version, installed_version)) {
@@ -652,7 +674,7 @@ void ClearInstalledPendingArtifacts(const std::filesystem::path &downloads_dir,
   }
 }
 
-void ClearInstalledPendingArtifactsForAllRoots(const std::string &installed_version) {
+void ClearInstalledPendingArtifactsForAllRoots(const std::string &installed_version, InputProfile input_profile) {
   if (installed_version.empty()) return;
   std::vector<std::filesystem::path> roots;
   for (const std::string &root : storage_paths::DetectStorageCardRoots()) {
@@ -668,7 +690,7 @@ void ClearInstalledPendingArtifactsForAllRoots(const std::string &installed_vers
     roots.push_back(cwd.parent_path());
   }
   for (const auto &root : roots) {
-    ClearInstalledPendingArtifacts(root / "Downloads", installed_version);
+    ClearInstalledPendingArtifacts(root / "Downloads", installed_version, input_profile);
   }
 }
 
@@ -690,6 +712,11 @@ bool ReadPendingMarker(const std::filesystem::path &marker_path, VersionUpdateSt
   std::error_code ec;
   if (package_path.empty() || !std::filesystem::exists(package_path, ec) || ec) {
     RemovePendingMarkerFile(marker_path);
+    return false;
+  }
+  if (IsRgdsPlusUpdateProfile(state.input_profile) &&
+      !IsPackageForProfile(package_path.filename().string(), state.input_profile)) {
+    AppendUpdateLog("Ignoring pending package for another device: " + package_path.string());
     return false;
   }
   if (version.empty()) {
@@ -747,7 +774,7 @@ bool BeginVersionUpdateDownloadInternal(VersionUpdateState &state) {
   const std::string installed_version = DetectInstalledVersionLabel();
   if (!installed_version.empty()) {
     state.current_version = installed_version;
-    ClearInstalledPendingArtifactsForAllRoots(installed_version);
+    ClearInstalledPendingArtifactsForAllRoots(installed_version, state.input_profile);
   }
 
   state.download_root = DetectDownloadRoot();
@@ -924,7 +951,7 @@ void InitializeVersionUpdateState(VersionUpdateState &state, const std::filesyst
   const std::string installed_version = DetectInstalledVersionLabel();
   if (!installed_version.empty()) {
     state.current_version = installed_version;
-    ClearInstalledPendingArtifactsForAllRoots(installed_version);
+    ClearInstalledPendingArtifactsForAllRoots(installed_version, state.input_profile);
   }
   state.download_root = DetectDownloadRoot();
   if (state.download_root.empty()) return;

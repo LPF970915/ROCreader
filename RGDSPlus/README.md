@@ -33,6 +33,30 @@ Validation: ARM rebuild, clean Windows build, lid/status/TXT regression tests,
 version increment tests, ZIP CRC and AArch64 executable checks passed.
 This release was not redeployed to the device for new physical acceptance tests.
 
+### Online update revision
+
+- The ver2.64 package uses its own update directory:
+  `https://github.com/LPF970915/ROCreader/tree/main/RGDSPlus/Downloads`.
+  The launcher sets this address and the updater also has a Plus-specific
+  default. Only packages ending in `for RGDS plus.zip` are selected.
+- Downloaded newer packages install on exit or the next start, retaining books,
+  covers, settings, keymaps, sources and reading progress. Foreign pending
+  packages are ignored; invalid package versions and installation failures
+  are not reported as successful updates.
+- This revision still reports ver2.64. An existing ver2.64 installation needs
+  one manual replacement with this revised package; subsequent ver2.65 and
+  newer packages can be installed online. Equal versions are not reinstalled.
+- Test selection with `make rgds-plus-update-regression`. On an isolated Linux
+  environment with `unzip`, run `python3 tools/test_rgds_plus_updater.py -v`
+  to test installation, restart, data preservation and rejection paths.
+  Set `ROCREADER_TEST_DOWNLOADS` to the release directory to include the
+  actual ver2.64 ZIP installation test.
+
+Validation: ARM and clean Windows builds, updater and existing regression tests,
+all eight installer tests (including the actual ZIP), live GitHub directory
+selection and a published-package download passed. No new on-device update
+test was performed.
+
 ## ver2.01 fixes
 
 - Use Brick's status-bar positions with the RGDS input map so battery,
