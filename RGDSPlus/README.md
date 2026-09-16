@@ -19,6 +19,20 @@ powershell -ExecutionPolicy Bypass -File RGDSPlus\build_rgds_plus_official.ps1
 The generated package is written to `RGDSPlus\Downloads\` and installs as
 `ROCreader_RGDSPlus` under `Roms/APPS`.
 
+## ver2.64 release
+
+- Rebuild the RGDS plus package as ver2.64, retaining the display, TXT, audio
+  and lid suspend fixes below.
+- Automatic versioning starts at ver2.64 when no newer package exists. With
+  ver2.64 in `Downloads`, the next build is ver2.65, then ver2.66.
+- Docker failures stop packaging immediately instead of accepting a stale ZIP.
+- Run `powershell -ExecutionPolicy Bypass -File tools\test_rgds_plus_release_version.ps1`
+  to check version increments without building or deploying.
+
+Validation: ARM rebuild, clean Windows build, lid/status/TXT regression tests,
+version increment tests, ZIP CRC and AArch64 executable checks passed.
+This release was not redeployed to the device for new physical acceptance tests.
+
 ## ver2.01 fixes
 
 - Use Brick's status-bar positions with the RGDS input map so battery,

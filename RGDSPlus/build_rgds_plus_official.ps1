@@ -13,22 +13,19 @@ function Get-NextRgdsReleaseVersion {
         [string]$DownloadsDir
     )
 
-    $maxVersionValue = $null
+    # Start at 2.64 even when the directory is empty or contains only old releases.
+    $maxVersionValue = 263
     if (Test-Path $DownloadsDir) {
         Get-ChildItem -LiteralPath $DownloadsDir -File -Filter "*for RGDS plus.zip" | ForEach-Object {
             if ($_.Name -match 'ver(\d+)\.(\d+)\s+for\s+RGDS plus\.zip$') {
                 $major = [int]$Matches[1]
                 $minor = [int]$Matches[2]
                 $value = ($major * 100) + $minor
-                if ($null -eq $maxVersionValue -or $value -gt $maxVersionValue) {
+                if ($value -gt $maxVersionValue) {
                     $maxVersionValue = $value
                 }
             }
         }
-    }
-
-    if ($null -eq $maxVersionValue) {
-        return "ver2.00"
     }
 
     $nextValue = $maxVersionValue + 1
@@ -73,6 +70,9 @@ if ([string]::IsNullOrWhiteSpace($ReleaseVersion)) {
 
 $image = "rocreader-rgds-plus-official:latest"
 docker build -t $image -f $Dockerfile (Split-Path $Dockerfile)
+if ($LASTEXITCODE -ne 0) {
+    throw "RGDS plus toolchain build failed with exit code $LASTEXITCODE"
+}
 
 $repoDocker = ($RepoRootAbs -replace "\\", "/")
 $outDocker = ($OutputDirAbs -replace "\\", "/")
@@ -137,6 +137,9 @@ docker run --rm `
     -e "RGDS_PLUS_RELEASE_VERSION=$ReleaseVersion" `
     $image `
     bash -lc $cmd
+if ($LASTEXITCODE -ne 0) {
+    throw "RGDS plus package build failed with exit code $LASTEXITCODE"
+}
 
 $ZipPath = Join-Path $DownloadsDirAbs $releaseZipName
 if (-not (Test-Path $ZipPath)) {
