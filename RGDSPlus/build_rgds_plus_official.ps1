@@ -96,6 +96,8 @@ MAKE_JOBS=$(nproc 2>/dev/null || echo 2) \
 
 rm -rf /work/RGDSPlus/dist_official/Roms
 mkdir -p /work/RGDSPlus/dist_official/Roms/APPS
+mkdir -p /work/RGDSPlus/dist_official/Roms/APPS/Imgs
+cp /work/RGDSPlus/Imgs/ROCreader_RGDSPlus.png /work/RGDSPlus/dist_official/Roms/APPS/Imgs/ROCreader_RGDSPlus.png
 cp -a /work/RGDSPlus/dist_official/base/APPS/ROCreader /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus
 cp /work/RGDSPlus/rgds_plus_official_launcher.sh /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus.sh
 cp /work/RGDSPlus/rgds_plus_power_control.sh /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus/rgds_power_control.sh
@@ -203,6 +205,10 @@ if (Test-Path $SdAppsDir) {
         }
     }
     Copy-Item -LiteralPath $LauncherSrc -Destination (Join-Path $SdAppsDir "ROCreader_RGDSPlus.sh") -Force
+    $ImagesDst = Join-Path $SdAppsDir "Imgs"
+    New-Item -ItemType Directory -Force -Path $ImagesDst | Out-Null
+    Copy-Item -LiteralPath (Join-Path $OutputDirAbs "Roms\APPS\Imgs\ROCreader_RGDSPlus.png") `
+        -Destination (Join-Path $ImagesDst "ROCreader_RGDSPlus.png") -Force
     Write-Host "Copied RGDS plus official package to $SdAppsDir"
 } else {
     Write-Host "SD apps dir not found; package left at $ZipPath"

@@ -18,6 +18,10 @@ powershell -ExecutionPolicy Bypass -File RGDSPlus\build_rgds_plus_official.ps1
 
 The generated package is written to `RGDSPlus\Downloads\` and installs as
 `ROCreader_RGDSPlus` under `Roms/APPS`.
+Like the H700 package, it includes an `Imgs` directory beside the launcher.
+`Roms/APPS/Imgs/ROCreader_RGDSPlus.png` uses the same ROC logo as H700, named
+to match `ROCreader_RGDSPlus.sh`. SD deployment and online updates install
+this image without replacing other applications' images.
 
 ## ver2.64 release
 

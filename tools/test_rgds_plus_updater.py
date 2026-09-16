@@ -9,6 +9,7 @@ import zipfile
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "RGDSPlus/rgds_plus_official_launcher.sh"
+LOGO = SOURCE.parent / "Imgs/ROCreader_RGDSPlus.png"
 
 
 class UpdateInstallerTests(unittest.TestCase):
@@ -22,6 +23,8 @@ class UpdateInstallerTests(unittest.TestCase):
         self.launcher = self.root / "ROCreader_RGDSPlus.sh"
         shutil.copyfile(SOURCE, self.launcher)
         self.launcher.chmod(0o755)
+        (self.root / "Imgs").mkdir()
+        (self.root / "Imgs/ROCreader.png").write_bytes(b"other app logo")
         (self.app / "version.txt").write_text("ver2.64\n")
         (self.app / "rocreader_sdl").write_text("old binary")
         self.preserved = {
@@ -51,6 +54,7 @@ class UpdateInstallerTests(unittest.TestCase):
             archive.writestr(prefix + "native_config.ini", "must not overwrite\n")
             archive.writestr(prefix + "rgds_power_control.sh", "#!/bin/sh\nexit 0\n")
             archive.writestr("Roms/APPS/ROCreader_RGDSPlus.sh", SOURCE.read_bytes())
+            archive.writestr("Roms/APPS/Imgs/ROCreader_RGDSPlus.png", LOGO.read_bytes())
         (self.downloads / "ROCreader_update_pending.txt").write_text(
             f"filename={path.name}\nversion={version}\n"
         )
@@ -63,6 +67,7 @@ class UpdateInstallerTests(unittest.TestCase):
         )
 
     def assert_preserved(self):
+        self.assertEqual((self.root / "Imgs/ROCreader.png").read_bytes(), b"other app logo")
         for name, text in self.preserved.items():
             self.assertEqual((self.app / name).read_text(), text, name)
 
@@ -71,6 +76,7 @@ class UpdateInstallerTests(unittest.TestCase):
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.app / "version.txt").read_text(), "ver2.65\n")
+        self.assertEqual((self.root / "Imgs/ROCreader_RGDSPlus.png").read_bytes(), LOGO.read_bytes())
         self.assertFalse(package.exists())
         self.assertFalse((self.downloads / "ROCreader_update_pending.txt").exists())
         self.assertIn("result=success", (self.app / "cache/update_boot_status.txt").read_text())
@@ -146,6 +152,7 @@ class UpdateInstallerTests(unittest.TestCase):
                 archive.read("Roms/APPS/ROCreader_RGDSPlus/rocreader_sdl"),
             )
         self.assertEqual(self.launcher.read_bytes(), SOURCE.read_bytes().replace(b"\r\n", b"\n"))
+        self.assertEqual((self.root / "Imgs/ROCreader_RGDSPlus.png").read_bytes(), LOGO.read_bytes())
         self.assert_preserved()
 
 

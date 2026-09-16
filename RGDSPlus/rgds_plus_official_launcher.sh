@@ -246,6 +246,16 @@ perform_pending_update_if_any() {
     fi
   fi
 
+  staged_logo="$UPDATE_STAGE_DIR/Roms/APPS/Imgs/ROCreader_RGDSPlus.png"
+  if [ -f "$staged_logo" ]; then
+    if ! mkdir -p "$SELF_DIR/Imgs" ||
+       ! cp "$staged_logo" "$SELF_DIR/Imgs/ROCreader_RGDSPlus.png.new" ||
+       ! mv "$SELF_DIR/Imgs/ROCreader_RGDSPlus.png.new" "$SELF_DIR/Imgs/ROCreader_RGDSPlus.png"; then
+      write_update_status "failed" "$package_version"
+      return 1
+    fi
+  fi
+
   if ! printf '%s\n' "$package_version" > "$APP_DIR/version.txt"; then
     write_update_status "failed" "$package_version"
     return 1
