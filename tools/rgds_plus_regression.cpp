@@ -1,5 +1,6 @@
 #include "app_layout.h"
 #include "lid_power_control.h"
+#include "key_guide_panel.h"
 #include "status_bar_runtime.h"
 #include "txt_reader_runtime.h"
 #include "txt_session_facade.h"
@@ -25,6 +26,85 @@ void Require(bool ok, const std::string &message) {
 }
 
 using Font = std::unique_ptr<TTF_Font, decltype(&TTF_CloseFont)>;
+
+void TestFontSizeLevels(const std::filesystem::path &out) {
+  const std::array<int, 10> sizes{{18, 20, 22, 24, 26, 28, 30, 32, 34, 36}};
+  const auto config_path = (out / "font_size_config.ini").string();
+  ConfigStore config(config_path);
+  Require(config.Get().txt_font_size_level == 3, "default font size changed");
+  for (int level = 0; level < static_cast<int>(sizes.size()); ++level) {
+    Require(ClampTxtFontSizeLevel(level) == level, "valid font level was clamped");
+    Require(TxtFontPointSizeForLevel(level) == sizes[level], "font level maps to wrong size");
+    config.Mutable().txt_font_size_level = level;
+    config.Save();
+    ConfigStore restored(config_path);
+    Require(restored.Get().txt_font_size_level == level, "saved font level lost on restart");
+  }
+  for (const auto boundary : {std::pair<int, int>{-1, 0}, {10, 9}, {999, 9}}) {
+    config.Mutable().txt_font_size_level = boundary.first;
+    config.Save();
+    ConfigStore restored(config_path);
+    Require(restored.Get().txt_font_size_level == boundary.second, "invalid saved font level not clamped");
+    Require(TxtFontPointSizeForLevel(boundary.first) == sizes[boundary.second],
+            "invalid font level maps outside the size table");
+  }
+  std::cout << "[pass] font sizes: 18..36, legacy indices, defaults, persistence and boundaries\n";
+}
+
+void TestKeyGuideTitle() {
+  SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, 1024, 768, 32, SDL_PIXELFORMAT_RGBA32);
+  Require(surface != nullptr, SDL_GetError());
+  SDL_Renderer *renderer = SDL_CreateSoftwareRenderer(surface);
+  Require(renderer != nullptr, SDL_GetError());
+  UiAssets assets{};
+  NativeConfig cfg{};
+  std::vector<SettingId> menu;
+  animation::TweenFloat anim;
+  TxtTranscodeJob transcode{};
+  SystemSettingsState system{};
+  TxtSettingsState txt{};
+  std::vector<ContributorAvatarEntry> avatars;
+  ContributorAvatarState avatar{};
+  KeyCalibrationState calibration{};
+  VersionUpdateState update{};
+  OnlineSourceState online{};
+  SettingsRuntimeRenderDeps deps{renderer, assets, cfg, InputProfile::RGDS, menu, 0,
+                                anim, 0, transcode, system, txt, avatars, avatar,
+                                calibration, false, update, online, {}, {}};
+  std::string title;
+  deps.services.draw_rect = [](int, int, int, int, SDL_Color, bool) {};
+  deps.services.get_title_text_texture = [&](const std::string &text, SDL_Color) -> TextCacheEntry * {
+    title = text;
+    return nullptr;
+  };
+  const char *old_model = std::getenv("ROCREADER_DEVICE_MODEL");
+  const std::string saved_model = old_model ? old_model : "";
+  auto set_model = [](const std::string &model) {
+#ifdef _WIN32
+    _putenv_s("ROCREADER_DEVICE_MODEL", model.c_str());
+#else
+    if (model.empty()) unsetenv("ROCREADER_DEVICE_MODEL");
+    else setenv("ROCREADER_DEVICE_MODEL", model.c_str(), 1);
+#endif
+  };
+  for (const char *model : {"rgds", "rgds-plus"}) {
+    set_model(model);
+    for (int language = 0; language < 12; ++language) {
+      DrawKeyGuidePanel(deps, SDL_Rect{0, 0, 1024, 768}, language, 100);
+      const bool plus = std::string(model) == "rgds-plus";
+      Require((title.find("RGDSplus") != std::string::npos) == plus, "key guide model title mismatch");
+      if (language == 0) {
+        Require(title == (plus ? u8"RGDSplus\u53cc\u5c4f\u4e13\u7528\u6620\u5c04"
+                              : u8"RGDS \u53cc\u5c4f\u4e13\u7528\u6620\u5c04"),
+                "Chinese key guide title mismatch");
+      }
+    }
+  }
+  set_model(saved_model);
+  SDL_DestroyRenderer(renderer);
+  SDL_FreeSurface(surface);
+  std::cout << "[pass] key guide titles: RGDS/Plus, 12 languages\n";
+}
 
 void TestLid(const std::filesystem::path &out) {
   RgdsPlusLidMonitor lid;
@@ -361,11 +441,17 @@ int main(int argc, char **argv) {
     const auto out = std::filesystem::path("build") / ("rgds_plus_checks_" + std::to_string(stamp));
     std::filesystem::create_directories(out);
     TestLid(out);
+    TestFontSizeLevels(out);
+    TestKeyGuideTitle();
     TestStatus(out);
     std::cout << "[pass] status: RGDS plus/Brick, original RGDS, desktop, GKD\n";
-    for (int level : {0, 2, 4}) TestText(out, 1024, 768, 2, level);
+    for (int level : {0, 2, 4, 5, 6, 7, 8, 9}) TestText(out, 1024, 768, 2, level);
     TestText(out, 640, 480, 2, 2);
     TestText(out, 1024, 768, 1, 2);
+    for (const auto size : {std::pair<int, int>{640, 480}, {720, 480}, {720, 720},
+                           {1024, 768}, {1600, 1440}}) {
+      TestText(out, size.first, size.second, 1, 9);
+    }
     std::cout << "[pass] snapshots: " << out.string() << "\n";
     TTF_Quit();
     SDL_Quit();

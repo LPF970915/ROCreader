@@ -189,7 +189,10 @@ struct ShelfLayoutMetrics {
   int nav_slot_w = 0;
   int nav_y = 0;
   int nav_pill_h = 32;
+  int nav_bar_bottom = 0;
 };
+
+float ShelfAnimationDelta(float dt);
 
 struct ShelfRuntimeRenderDeps {
   SDL_Renderer *renderer = nullptr;

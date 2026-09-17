@@ -1,6 +1,7 @@
 #include "app_stores.h"
 #include "app_language.h"
 #include "system_settings_runtime.h"
+#include "txt_settings_runtime.h"
 
 #include <algorithm>
 #include <fstream>
@@ -84,6 +85,10 @@ void ConfigStore::Load() {
   bool saw_txt_font_size_level = false;
   std::string line;
   while (std::getline(in, line)) {
+    // Windows-edited config files retain CR on Linux; do not turn "1\r" into false.
+    const size_t last = line.find_last_not_of(" \t\r");
+    if (last == std::string::npos) continue;
+    line.erase(last + 1);
     const size_t eq = line.find('=');
     if (eq == std::string::npos) continue;
     const std::string k = line.substr(0, eq);
@@ -146,7 +151,7 @@ void ConfigStore::Load() {
   cfg_.auto_sleep_interval_index = ClampAutoSleepIntervalIndex(cfg_.auto_sleep_interval_index);
   cfg_.txt_background_color = std::clamp(cfg_.txt_background_color, 0, 4);
   cfg_.txt_font_color = std::clamp(cfg_.txt_font_color, 0, 4);
-  cfg_.txt_font_size_level = std::clamp(cfg_.txt_font_size_level, 0, 4);
+  cfg_.txt_font_size_level = ClampTxtFontSizeLevel(cfg_.txt_font_size_level);
   if (!saw_system_volume_percent || !saw_screen_brightness_level || !saw_screen_brightness_schema ||
       !saw_auto_sleep_interval_schema || !saw_auto_sleep_interval_index || !saw_txt_background_color ||
       !saw_txt_font_color || !saw_txt_font_size_level) {

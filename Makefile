@@ -8,6 +8,8 @@ WN04_FETCH_TARGET ?= bin/wn04_fetch
 RGDS_DUALSCREEN_PROBE_TARGET ?= build/rgds_sdl_dualscreen_probe
 RGDS_PLUS_REGRESSION_TARGET ?= build/rgds_plus_regression
 RGDS_PLUS_UPDATE_REGRESSION_TARGET ?= build/rgds_plus_update_regression
+SHELF_ANIMATION_REGRESSION_TARGET ?= build/shelf_animation_regression
+IMAGE_FLOW_REGRESSION_TARGET ?= build/image_flow_regression
 APP_SRCS := \
   src/main.cpp \
   src/app_loop.cpp \
@@ -244,7 +246,7 @@ $(error REQUIRE_MUPDF=1 but no real PDF backend found. Install MuPDF/Fitz or pop
 endif
 endif
 
-.PHONY: all clean run print-config smoke-windows wn04-fetch rgds-dualscreen-probe rgds-plus-regression rgds-plus-update-regression
+.PHONY: all clean run print-config smoke-windows wn04-fetch rgds-dualscreen-probe rgds-plus-regression rgds-plus-update-regression shelf-animation-regression image-flow-regression
 
 all: $(TARGET)
 
@@ -269,6 +271,23 @@ $(RGDS_PLUS_REGRESSION_TARGET): tools/rgds_plus_regression.cpp $(filter-out src/
 
 rgds-plus-update-regression: $(RGDS_PLUS_UPDATE_REGRESSION_TARGET)
 	./$(RGDS_PLUS_UPDATE_REGRESSION_TARGET)
+
+shelf-animation-regression: $(SHELF_ANIMATION_REGRESSION_TARGET)
+	./$(SHELF_ANIMATION_REGRESSION_TARGET)
+
+image-flow-regression: $(IMAGE_FLOW_REGRESSION_TARGET)
+	./$(IMAGE_FLOW_REGRESSION_TARGET) scale
+	./$(IMAGE_FLOW_REGRESSION_TARGET)
+
+src/zip_image_reader.o src/epub_comic_reader.o src/zip_image_runtime.o src/epub_comic_runtime.o src/pdf_runtime.o: src/image_flow_layout.h
+
+$(IMAGE_FLOW_REGRESSION_TARGET): tools/image_flow_regression.cpp $(filter-out src/main.o,$(OBJS))
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(SHELF_ANIMATION_REGRESSION_TARGET): tools/shelf_animation_regression.cpp $(filter-out src/main.o,$(OBJS))
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(RGDS_PLUS_UPDATE_REGRESSION_TARGET): tools/rgds_plus_update_regression.cpp src/version_update_runtime.cpp $(filter-out src/main.o src/version_update_runtime.o,$(OBJS))
 	@mkdir -p $(dir $@)
@@ -312,4 +331,4 @@ print-config:
 	@echo "REQUIRE_MUPDF=$(REQUIRE_MUPDF)"
 
 clean:
-	rm -f src/*.o $(TARGET) $(WN04_FETCH_TARGET) $(RGDS_DUALSCREEN_PROBE_TARGET) $(RGDS_PLUS_REGRESSION_TARGET) $(RGDS_PLUS_UPDATE_REGRESSION_TARGET)
+	rm -f src/*.o $(TARGET) $(WN04_FETCH_TARGET) $(RGDS_DUALSCREEN_PROBE_TARGET) $(RGDS_PLUS_REGRESSION_TARGET) $(RGDS_PLUS_UPDATE_REGRESSION_TARGET) $(SHELF_ANIMATION_REGRESSION_TARGET) $(IMAGE_FLOW_REGRESSION_TARGET)

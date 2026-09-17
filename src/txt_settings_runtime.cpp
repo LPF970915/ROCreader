@@ -28,7 +28,7 @@ constexpr std::array<SDL_Color, kColorOptionCount> kFontColors = {{
     {0, 0, 0, 255},
 }};
 
-constexpr std::array<int, 5> kFontPointSizes = {{18, 20, 22, 24, 26}};
+constexpr std::array<int, 10> kFontPointSizes = {{18, 20, 22, 24, 26, 28, 30, 32, 34, 36}};
 
 int ColorLuma(SDL_Color color) { return color.r * 299 + color.g * 587 + color.b * 114; }
 

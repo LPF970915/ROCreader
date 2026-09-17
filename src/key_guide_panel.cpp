@@ -2,6 +2,7 @@
 
 #include "app_language.h"
 #include "key_calibration_runtime.h"
+#include "screen_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -317,11 +318,18 @@ void DrawKeyGuidePanel(SettingsRuntimeRenderDeps &deps, SDL_Rect preview_rect,
       profile_text_id = AppTextId::KeyGuideProfileTrimuiBrick;
     }
   }
-  const std::string profile_title =
+  std::string profile_title =
       rgds_guide ? rgds_guide->title
                  : (gkd_profile ? GkdKeyGuideTitle(language_index)
                     : deps.has_calibrated_keymap ? CalibratedKeyGuideTitle(language_index)
                                                 : LocalizedAppText(language_index, profile_text_id));
+  if (rgds_guide && DetectDeviceModelToken() == "rgds-plus") {
+    const size_t model_pos = profile_title.find("RGDS");
+    if (model_pos != std::string::npos) profile_title.replace(model_pos, 4, "RGDSplus");
+    if (language_index == 0) {
+      profile_title = u8"RGDSplus\u53cc\u5c4f\u4e13\u7528\u6620\u5c04";
+    }
+  }
   const int max_text_w = std::max(0, right - left);
   if (TextCacheEntry *profile = get_text(profile_title, title_color, true); profile && profile->texture) {
     SDL_Rect dst{left, divider_y - profile->h - ScalePx(scale, gkd_profile ? 12 : 8), profile->w, profile->h};

@@ -127,5 +127,6 @@ class ShelfScene {
 public:
   void ResetToCategoryRoot(ShelfSceneState &state) const;
   void HandleInput(const ShelfSceneInputContext &context) const;
+  void TickAnimations(ShelfSceneState &state, float dt, bool enabled) const;
   void Draw(const ShelfSceneRenderContext &context) const;
 };

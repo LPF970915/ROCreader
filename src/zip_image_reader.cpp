@@ -1,4 +1,5 @@
 #include "zip_image_reader.h"
+#include "image_flow_layout.h"
 
 #include "image_decode.h"
 #include "runtime_log.h"
@@ -427,7 +428,7 @@ bool ZipImageReader::RenderPageRGBA(int page_index, float scale, std::vector<uns
                                     const std::atomic<bool> *cancel) {
   if (!IsOpen()) return false;
   page_index = std::clamp(page_index, 0, PageCount() - 1);
-  scale = std::max(0.1f, scale);
+  scale = std::max(image_flow::kMinRenderScale, scale);
   if (cancel && cancel->load()) return false;
 #ifdef HAVE_LIBZIP
   PageEntry &entry = impl_->pages[page_index];

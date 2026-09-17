@@ -23,6 +23,132 @@ Like the H700 package, it includes an `Imgs` directory beside the launcher.
 to match `ROCreader_RGDSPlus.sh`. SD deployment and online updates install
 this image without replacing other applications' images.
 
+## ver2.68 release
+
+- Fix continuous image-page clipping using actual page extents, not the viewport
+  height. Pages shorter than the dual-screen canvas now join at their real end;
+  all four rotations share the same clipping helper. ZIP, comic EPUB and PDF
+  runtimes use this device-independent fix.
+- Match ZIP/EPUB decoding to the runtime's 0.05 minimum render scale, avoiding
+  larger textures than the dimensions used for scrolling.
+- Bound shelf animation steps after idle waits or slow cover loads. Preserve
+  the existing animation setting, including an explicit disabled preference.
+- Accept CRLF and trailing whitespace in config values so Windows-edited
+  boolean settings do not become false on Linux.
+- Ship dedicated, LF-normalized release defaults with animations and lid sleep
+  both enabled. Packaging no longer copies these defaults from the developer's
+  live config. A fresh extraction is ready to use; online updates still preserve
+  existing user settings.
+
+History: `9a3ec48` (2026-07-27) fixed ZIP size probing and remains present.
+`22ab47d` added a GKD page-end screen-jump workaround, but `886dd88` reverted
+it later the same day. This release fixes geometry rather than restoring that
+device-specific workaround.
+
+Device audit: the installed ver2.67 binary matched the previous release SHA256,
+but `native_config.ini` contained `animations=0`. A runtime/config backup was
+created at `/mnt/sdcard/rocreader_flowfix_20260918_OYOChZ/`, and only that setting
+was changed to `1`. The lid-sleep setting was also found disabled and restored
+to `1` at the user's request. The ver2.67 ZIP was confirmed to contain CRLF
+values (`animations=1\r`, `lid_close_screen_off=1\r`): the old Linux parser
+compared them literally to `"1"` and would load/save them as disabled.
+The firmware hall node and native suspend interface are unchanged. A guarded
+12-second RTC wake test returned success and advanced the suspend-success count
+from 3 to 4. Physical lid-close/lid-open acceptance remains manual.
+
+Run `make image-flow-regression` for ZIP/EPUB scale and pixel tests across six
+viewports (including 1024x1536), four rotations and short/equal/long pages.
+The pre-fix implementation failed both the 0.05 scale test and short-page tail
+pixel check. Native tests now pass, along with `make shelf-animation-regression`
+(including long frames and config round-trips) and `make rgds-plus-regression`.
+The shared PDF clipping path is compiled but does not yet have an end-to-end
+PDF fixture in this regression.
+
+Release validation: ARM build, ZIP CRC and all eight installer tests using the
+final ver2.68 ZIP passed, including enabled defaults and LF-only config bytes.
+The six-viewport image tests also passed with RGDS Plus fast prefetch enabled.
+Installed on `192.168.31.116` through the pending-update installer; it reported
+success and the executable SHA256 matched the package. All 43 book/cover hashes
+and six config/progress hashes matched their pre-install values. Startup scanned
+55 books and the application subsequently exited with code 0; both requested
+switches remained `1` after exit.
+
+## ver2.67 release
+
+- Extend shared TXT font sizes with 28, 30, 32, 34 and 36, retaining the
+  existing 18-26 options. Saved settings now restore all ten levels.
+- Use the RGDSplus-specific dual-screen mapping title in the key guide.
+- Retain the shelf animation, navigation clipping, Plus update address and logo.
+
+Validation: native build and Plus regressions passed, including font-level
+persistence, invalid-level boundaries and large-text layout in five profiles.
+ARM build, ZIP CRC, AArch64 checks and all eight installer tests using the
+actual ver2.67 ZIP passed. Deployed to `192.168.31.116` on 2026-09-17 through
+the launcher's pending-update installer; it reported success. Installed
+binary/launcher/logo hashes matched the package, all 43 user-file checksums
+were preserved, and `animations=1` remained unchanged. Startup completed
+with 16 books, two displays and the OpenGL ES 2 spanning renderer.
+Physical font-size and key-guide appearance checks remain manual.
+
+The complete ver2.66 backup is on the second card at
+`/mnt/sdcard/rocreader_ver267_20260917_sjgDfo/backup_ver266.tar`.
+
+## ver2.66 release
+
+- Clip all shelf cards at the bottom edge of each display profile's navigation
+  bar. Covers, shadows, selection frames and titles cannot draw into the
+  navigation/status region while rows move.
+- Apply the same boundary to local/online shelves, focus overlays and cached
+  pages. Nested title marquee clips intersect and restore the outer clip;
+  fully clipped titles are skipped.
+- Keep ver2.65's accepted animation behavior unchanged. This shared renderer
+  fix applies to all model builds, not only RGDS Plus.
+
+Validation: five display profiles passed pixel checks throughout upward/downward
+transitions, local/online navigation, cold/warm page caches, caller clipping and
+offscreen render targets. Existing animation, Plus and updater regressions,
+Windows/ARM builds, all eight installer tests using the actual ver2.66 ZIP,
+ZIP CRC and AArch64 checks passed. Deployed ver2.66 to `192.168.31.116` after
+connectivity recovered. The installer reported success, installed
+binary/launcher/logo hashes matched, and all 43 user-file checksums were
+preserved, including `animations=1`. Startup completed with 16 books and
+the dual-screen renderer initialized. Physical navigation-clipping acceptance
+remains pending.
+
+The complete ver2.65 backup is on the second card at
+`/mnt/sdcard/rocreader_ver266_20260917_1QuRzy/backup_ver265.tar`.
+
+## ver2.65 release
+
+- Keep cover focus scaling active during row changes instead of snapping both
+  the old and new selections to their final sizes.
+- Draw overlapping row windows only once and scroll by the actual row pitch.
+  Normalize focus scaling speed to keep comparable timing across display sizes.
+- Match ROCgalgame's 0.18-second cubic ease-out row transition timing. This is
+  eased scrolling, not a spring/overshoot animation or a full frontend port.
+- Keep the navigation clipping/mask unchanged pending physical device testing.
+  The existing animation setting must be enabled to see these transitions.
+- Retain the Plus-specific online update address, installer and launcher logo.
+
+Run `make shelf-animation-regression` for navigation, row overlap, focus scaling,
+disabled-animation and multi-resolution checks.
+Set `ROCREADER_TEST_DOWNLOADS` to the release directory and
+`ROCREADER_TEST_VERSION=ver2.65` when running the installer tests to check the
+actual release ZIP as well.
+
+Validation: ARM and clean Windows builds, five-resolution animation checks at
+30/60 fps, existing Plus regressions, version increment tests, all eight
+installer tests (including the actual ver2.65 ZIP), ZIP CRC and AArch64 checks
+passed. Deployed ver2.65 to `192.168.31.116` after SSH connectivity recovered.
+The installer reported success, installed binary/launcher/logo hashes matched,
+and all 43 user-file checksums were preserved before enabling animations.
+Only `animations=0` was changed to `animations=1`. Startup completed with
+16 books and the dual-screen renderer initialized; physical animation and
+navigation-overlap acceptance remain pending.
+
+The complete ver2.64 backup is on the second card at
+`/mnt/sdcard/rocreader_ver265_20260917_BjjrG1/backup_ver264.tar`.
+
 ## ver2.64 release
 
 - Rebuild the RGDS plus package as ver2.64, retaining the display, TXT, audio

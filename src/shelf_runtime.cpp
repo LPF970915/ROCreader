@@ -5,6 +5,41 @@
 #include <array>
 #include <sstream>
 
+namespace {
+// Nested title clips must intersect, then restore, the shelf/caller clip.
+class ScopedShelfClip {
+ public:
+  ScopedShelfClip(SDL_Renderer *renderer, SDL_Rect clip) : renderer_(renderer) {
+    enabled_ = SDL_RenderIsClipEnabled(renderer_);
+    SDL_RenderGetClipRect(renderer_, &previous_);
+    if (enabled_) {
+      SDL_Rect intersection{};
+      SDL_IntersectRect(&previous_, &clip, &intersection);
+      clip = intersection;
+    }
+    empty_ = SDL_RectEmpty(&clip);
+    SDL_RenderSetClipRect(renderer_, &clip);
+  }
+  ~ScopedShelfClip() {
+    SDL_RenderSetClipRect(renderer_, enabled_ ? &previous_ : nullptr);
+  }
+  ScopedShelfClip(const ScopedShelfClip &) = delete;
+  ScopedShelfClip &operator=(const ScopedShelfClip &) = delete;
+  bool Empty() const { return empty_; }
+
+ private:
+  SDL_Renderer *renderer_;
+  SDL_bool enabled_;
+  SDL_Rect previous_{};
+  bool empty_ = false;
+};
+}  // namespace
+
+float ShelfAnimationDelta(float dt) {
+  // Idle waits and synchronous cover IO are not visible animation frames.
+  return std::clamp(dt, 0.0f, 1.0f / 30.0f);
+}
+
 ShelfCategory ClampShelfCategory(int nav_selected_index) {
   if (nav_selected_index <= 0) return ShelfCategory::AllComics;
   if (nav_selected_index == 1) return ShelfCategory::AllBooks;
@@ -338,50 +373,56 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
   std::vector<RenderEntry> render_items;
   render_items.reserve(static_cast<size_t>(deps.k_items_per_page * 2));
 
-  struct PagePlan {
-    int page = 0;
-    float shift_y = 0.0f;
-  };
-  std::vector<PagePlan> pages_to_draw;
-  if (deps.page_animating) {
-    const float slide = std::clamp(deps.page_slide_value, 0.0f, 1.0f);
-    pages_to_draw.push_back(PagePlan{deps.page_anim_from, -static_cast<float>(deps.page_anim_dir) * deps.layout.screen_h * slide});
-    pages_to_draw.push_back(
-        PagePlan{deps.page_anim_to, static_cast<float>(deps.page_anim_dir) * deps.layout.screen_h * (1.0f - slide)});
-  } else {
-    pages_to_draw.push_back(PagePlan{deps.shelf_page, 0.0f});
-  }
+  // A shelf page advances by one row, so the source/destination windows overlap.
+  // Update and draw their union once, with scrolling separate from focus scaling.
+  const int first_page = deps.page_animating ? std::min(deps.page_anim_from, deps.page_anim_to) : deps.shelf_page;
+  const int last_page = deps.page_animating ? std::max(deps.page_anim_from, deps.page_anim_to) : deps.shelf_page;
+  const int start = first_page * deps.k_grid_cols;
+  const int end = std::min<int>(last_page * deps.k_grid_cols + deps.k_items_per_page,
+                                deps.shelf_runtime.items.size());
+  const float row_pitch = static_cast<float>(deps.layout.cover_h + deps.layout.grid_gap_y);
+  const float shift_y = deps.page_animating
+                            ? (deps.page_anim_to - deps.page_anim_from) * row_pitch *
+                                  (1.0f - std::clamp(deps.page_slide_value, 0.0f, 1.0f))
+                            : 0.0f;
+  // Preserve GKD's current timing rather than speeding up smaller covers.
+  const float scale_speed_w = deps.card_scale_linear_speed_w * deps.layout.cover_w / 314.0f;
+  const float scale_speed_h = deps.card_scale_linear_speed_h * deps.layout.cover_h / 471.0f;
+  for (int i = start; i < end; ++i) {
+    const int local = i - deps.shelf_page * deps.k_grid_cols;
+    const int row = i / deps.k_grid_cols - deps.shelf_page;
+    const int col = i % deps.k_grid_cols;
+    const float base_x = static_cast<float>(deps.layout.grid_start_x + col * (deps.layout.cover_w + deps.layout.grid_gap_x));
+    const float base_y = static_cast<float>(deps.layout.grid_start_y + row * (deps.layout.cover_h + deps.layout.grid_gap_y));
+    const float base_cx = base_x + static_cast<float>(deps.layout.cover_w) * 0.5f;
+    const float base_cy = base_y + static_cast<float>(deps.layout.cover_h) * 0.5f;
+    const bool focused = (i == deps.focus_index);
 
-  for (const auto &pp : pages_to_draw) {
-    const int start = pp.page * deps.k_grid_cols;
-    const int end = std::min<int>(start + deps.k_items_per_page, deps.shelf_runtime.items.size());
-    for (int i = start; i < end; ++i) {
-      int local = i - start;
-      int row = local / deps.k_grid_cols;
-      int col = local % deps.k_grid_cols;
-      float base_x = static_cast<float>(deps.layout.grid_start_x + col * (deps.layout.cover_w + deps.layout.grid_gap_x));
-      float base_y = static_cast<float>(deps.layout.grid_start_y + row * (deps.layout.cover_h + deps.layout.grid_gap_y));
-      float base_cx = base_x + static_cast<float>(deps.layout.cover_w) * 0.5f;
-      float base_cy = base_y + static_cast<float>(deps.layout.cover_h) * 0.5f;
-      bool focused = (i == deps.focus_index);
-
-      GridItemAnim &anim = deps.grid_item_anims[i];
-      anim.tcx = base_cx;
-      anim.tcy = base_cy + pp.shift_y;
-      anim.tw = focused ? deps.focus_cover_w : static_cast<float>(deps.layout.cover_w);
-      anim.th = focused ? deps.focus_cover_h : static_cast<float>(deps.layout.cover_h);
-      anim.t_alpha = focused ? 255.0f : deps.unfocused_alpha;
-      if (!deps.animate_enabled || deps.page_animating) {
-        anim.SnapToTarget();
-      } else {
-        anim.Update(deps.dt, deps.card_move_linear_speed_x, deps.card_move_linear_speed_y,
-                    deps.card_move_tail_ratio, deps.card_move_tail_min_mul,
-                    deps.card_scale_linear_speed_w, deps.card_scale_linear_speed_h,
-                    deps.card_scale_tail_ratio, deps.card_scale_tail_min_mul);
-        deps.any_grid_animating = deps.any_grid_animating || anim.IsAnimating();
-      }
-      render_items.push_back(RenderEntry{i, focused, pp.page == deps.shelf_page});
+    GridItemAnim &anim = deps.grid_item_anims[i];
+    anim.tcx = base_cx;
+    anim.tcy = base_cy + shift_y;
+    if (deps.animate_enabled && deps.page_animating && !anim.initialized) {
+      anim.tw = static_cast<float>(deps.layout.cover_w);
+      anim.th = static_cast<float>(deps.layout.cover_h);
+      anim.SnapToTarget();
     }
+    anim.tw = focused ? deps.focus_cover_w : static_cast<float>(deps.layout.cover_w);
+    anim.th = focused ? deps.focus_cover_h : static_cast<float>(deps.layout.cover_h);
+    anim.t_alpha = focused ? 255.0f : deps.unfocused_alpha;
+    if (!deps.animate_enabled) {
+      anim.SnapToTarget();
+    } else {
+      if (deps.page_animating) {
+        anim.cx = anim.tcx;
+        anim.cy = anim.tcy;
+      }
+      anim.Update(ShelfAnimationDelta(deps.dt), deps.card_move_linear_speed_x, deps.card_move_linear_speed_y,
+                  deps.card_move_tail_ratio, deps.card_move_tail_min_mul,
+                  scale_speed_w, scale_speed_h,
+                  deps.card_scale_tail_ratio, deps.card_scale_tail_min_mul);
+      deps.any_grid_animating = deps.any_grid_animating || anim.IsAnimating();
+    }
+    render_items.push_back(RenderEntry{i, focused, local >= 0 && local < deps.k_items_per_page});
   }
 
   auto static_page_key = [&](int page) {
@@ -573,7 +614,8 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
     deps.get_text_texture(display, title_color, tw, th, text_tex);
     if (!text_tex) return;
 
-    SDL_RenderSetClipRect(deps.renderer, &clip);
+    ScopedShelfClip title_clip(deps.renderer, clip);
+    if (title_clip.Empty()) return;
     const int text_y = text_area_y + std::max(0, (text_area_h - th) / 2);
     if (focused && tw > text_area_w) {
       const float span = static_cast<float>(tw + deps.layout.title_marquee_gap_px);
@@ -587,7 +629,6 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
       SDL_Rect td{centered_x, text_y, tw, th};
       SDL_RenderCopy(deps.renderer, text_tex, nullptr, &td);
     }
-    SDL_RenderSetClipRect(deps.renderer, nullptr);
   };
 
   auto draw_nav_chrome = [&]() {
@@ -652,27 +693,34 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
     }
   };
 
+  const int shelf_clip_top = std::clamp(deps.layout.nav_bar_bottom, 0, deps.layout.screen_h);
+  const SDL_Rect shelf_clip{0, shelf_clip_top, deps.layout.screen_w, deps.layout.screen_h - shelf_clip_top};
+
   auto render_shelf_static_layer = [&]() {
     if (deps.ui_assets.background_main) {
       SDL_Rect bg_dst{0, 0, deps.layout.screen_w, deps.layout.screen_h};
       SDL_RenderCopy(deps.renderer, deps.ui_assets.background_main, nullptr, &bg_dst);
     }
 
-    for (const RenderEntry &e : render_items) {
-      if (e.focused) continue;
-      const BookItem &item = deps.shelf_runtime.items[e.index];
-      GridItemAnim &anim = deps.grid_item_anims[e.index];
-      SDL_Rect dst{
-          static_cast<int>(std::round(anim.x)),
-          static_cast<int>(std::round(anim.y)),
-          static_cast<int>(std::round(anim.w)),
-          static_cast<int>(std::round(anim.h)),
-      };
-      const SDL_Rect outer = make_outer_frame_rect(dst);
-      const Uint8 alpha = static_cast<Uint8>(std::clamp(anim.alpha, 0.0f, 255.0f));
-      draw_cover_under_shadow(outer);
-      draw_cover(item, dst, alpha);
-      if (!deps.page_animating || e.on_current_page) draw_title_overlay(item, dst, false);
+    {
+      ScopedShelfClip cards_clip(deps.renderer, shelf_clip);
+      for (const RenderEntry &e : render_items) {
+        if (cards_clip.Empty()) break;
+        if (e.focused) continue;
+        const BookItem &item = deps.shelf_runtime.items[e.index];
+        GridItemAnim &anim = deps.grid_item_anims[e.index];
+        SDL_Rect dst{
+            static_cast<int>(std::round(anim.x)),
+            static_cast<int>(std::round(anim.y)),
+            static_cast<int>(std::round(anim.w)),
+            static_cast<int>(std::round(anim.h)),
+        };
+        const SDL_Rect outer = make_outer_frame_rect(dst);
+        const Uint8 alpha = static_cast<Uint8>(std::clamp(anim.alpha, 0.0f, 255.0f));
+        draw_cover_under_shadow(outer);
+        draw_cover(item, dst, alpha);
+        if (!deps.page_animating || e.on_current_page) draw_title_overlay(item, dst, false);
+      }
     }
 
     if (deps.ui_assets.top_status_bar) draw_native(deps.ui_assets.top_status_bar, 0, 0);
@@ -696,6 +744,8 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
   };
 
   auto render_static_page_cards = [&](int page, float shift_y, bool skip_focused, bool cached_only) {
+    ScopedShelfClip cards_clip(deps.renderer, shelf_clip);
+    if (cards_clip.Empty()) return;
     const int start = page * deps.k_grid_cols;
     const int end = std::min<int>(start + deps.k_items_per_page, deps.shelf_runtime.items.size());
     for (int i = start; i < end; ++i) {
@@ -738,14 +788,21 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
                                              deps.layout.screen_w, deps.layout.screen_h);
     if (!texture) return nullptr;
     SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND);
+    SDL_Texture *previous_target = SDL_GetRenderTarget(deps.renderer);
+    const SDL_bool previous_clip_enabled = SDL_RenderIsClipEnabled(deps.renderer);
+    SDL_Rect previous_clip{};
+    SDL_RenderGetClipRect(deps.renderer, &previous_clip);
     if (SDL_SetRenderTarget(deps.renderer, texture) != 0) {
       SDL_DestroyTexture(texture);
       return nullptr;
     }
+    // Bake the whole shelf cache independently of the caller's temporary clip.
+    SDL_RenderSetClipRect(deps.renderer, nullptr);
     SDL_SetRenderDrawColor(deps.renderer, 0, 0, 0, 0);
     SDL_RenderClear(deps.renderer);
     render_static_page_cards(page, 0.0f, false, true);
-    SDL_SetRenderTarget(deps.renderer, nullptr);
+    SDL_SetRenderTarget(deps.renderer, previous_target);
+    SDL_RenderSetClipRect(deps.renderer, previous_clip_enabled ? &previous_clip : nullptr);
     deps.render_cache.static_page_textures[key] = texture;
     return texture;
   };
@@ -783,7 +840,8 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
     draw_shelf_background();
     SDL_Texture *static_page = get_or_create_static_page_texture(deps.shelf_page);
     if (static_page) {
-      SDL_RenderCopy(deps.renderer, static_page, nullptr, nullptr);
+      ScopedShelfClip cards_clip(deps.renderer, shelf_clip);
+      if (!cards_clip.Empty()) SDL_RenderCopy(deps.renderer, static_page, nullptr, nullptr);
     } else {
       render_static_page_cards(deps.shelf_page, 0.0f, true, true);
     }
@@ -796,6 +854,8 @@ void DrawShelfRuntime(ShelfRuntimeRenderDeps &deps) {
 
   for (const RenderEntry &e : render_items) {
     if (!e.focused) continue;
+    ScopedShelfClip cards_clip(deps.renderer, shelf_clip);
+    if (cards_clip.Empty()) break;
     const BookItem &item = deps.shelf_runtime.items[e.index];
     GridItemAnim &anim = deps.grid_item_anims[e.index];
     SDL_Rect focus_rect{

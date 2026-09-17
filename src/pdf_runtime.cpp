@@ -2,6 +2,7 @@
 
 #include "async_image_render_queue.h"
 #include "image_runtime_tuning.h"
+#include "image_flow_layout.h"
 #include "pdf_reader.h"
 
 #include <SDL.h>
@@ -1068,7 +1069,8 @@ struct PdfRuntime::Impl {
 
     const int rotation = NormalizeRotation(state.view.rotation);
     const int transition_start = TransitionStartYOffset(state);
-    if (state.location.y_offset <= transition_start) return false;
+    if (state.location.y_offset <= transition_start &&
+        RenderedFlowExtent(state) >= ViewportFlowExtent(state)) return false;
 
     const VisibleContentSource current_source = LookupSourceForState(state);
     if (!current_source.valid || !current_source.texture) return false;
@@ -1082,59 +1084,20 @@ struct PdfRuntime::Impl {
     const bool horizontal_flow = (rotation == 90 || rotation == 270);
     const bool positive_flow = (rotation == 0 || rotation == 270);
     const int viewport_extent = ViewportFlowExtent(state);
-    const int overflow = std::clamp(state.location.y_offset - transition_start, 0, viewport_extent);
-    if (overflow <= 0) return false;
-    const int current_visible = std::max(0, viewport_extent - overflow);
-
-    if (current_visible > 0) {
-      ViewportLayout current_layout =
-          ComputeViewportLayout(state, current_source.texture_w, current_source.texture_h);
-      if (current_layout.valid) {
-        if (horizontal_flow) {
-          const int src_start = positive_flow
-                                    ? std::clamp(state.location.y_offset, 0,
-                                                 std::max(0, current_source.texture_w - current_visible))
-                                    : std::clamp(current_source.texture_w - state.location.y_offset - current_visible,
-                                                 0, std::max(0, current_source.texture_w - current_visible));
-          current_layout.src.x = src_start;
-          current_layout.src.w = std::min(current_visible, current_source.texture_w - current_layout.src.x);
-          current_layout.dst.x = positive_flow ? 0 : overflow;
-          current_layout.dst.w = current_layout.src.w;
-        } else {
-          const int src_start = positive_flow
-                                    ? std::clamp(state.location.y_offset, 0,
-                                                 std::max(0, current_source.texture_h - current_visible))
-                                    : std::clamp(current_source.texture_h - state.location.y_offset - current_visible,
-                                                 0, std::max(0, current_source.texture_h - current_visible));
-          current_layout.src.y = src_start;
-          current_layout.src.h = std::min(current_visible, current_source.texture_h - current_layout.src.y);
-          current_layout.dst.y = positive_flow ? 0 : overflow;
-          current_layout.dst.h = current_layout.src.h;
-        }
-        if (current_layout.src.w > 0 && current_layout.src.h > 0 &&
-            current_layout.dst.w > 0 && current_layout.dst.h > 0) {
-          SDL_RenderCopy(renderer, current_source.texture, &current_layout.src, &current_layout.dst);
-        }
-      }
+    const int current_extent = horizontal_flow ? current_source.texture_w : current_source.texture_h;
+    ViewportLayout current_layout =
+        ComputeViewportLayout(state, current_source.texture_w, current_source.texture_h);
+    if (current_layout.valid &&
+        image_flow::ClipSlice(current_layout.src, current_layout.dst, current_extent, viewport_extent,
+                              state.location.y_offset, horizontal_flow, positive_flow)) {
+      SDL_RenderCopy(renderer, current_source.texture, &current_layout.src, &current_layout.dst);
     }
 
     ViewportLayout next_layout = ComputeViewportLayout(next_state, next_source.texture_w, next_source.texture_h);
-    if (!next_layout.valid) return true;
-    if (horizontal_flow) {
-      const int src_start = positive_flow ? 0 : std::max(0, next_source.texture_w - overflow);
-      next_layout.src.x = src_start;
-      next_layout.src.w = std::min(overflow, next_source.texture_w - next_layout.src.x);
-      next_layout.dst.x = positive_flow ? current_visible : 0;
-      next_layout.dst.w = next_layout.src.w;
-    } else {
-      const int src_start = positive_flow ? 0 : std::max(0, next_source.texture_h - overflow);
-      next_layout.src.y = src_start;
-      next_layout.src.h = std::min(overflow, next_source.texture_h - next_layout.src.y);
-      next_layout.dst.y = positive_flow ? current_visible : 0;
-      next_layout.dst.h = next_layout.src.h;
-    }
-    if (next_layout.src.w > 0 && next_layout.src.h > 0 &&
-        next_layout.dst.w > 0 && next_layout.dst.h > 0) {
+    const int next_extent = horizontal_flow ? next_source.texture_w : next_source.texture_h;
+    if (next_layout.valid &&
+        image_flow::ClipSlice(next_layout.src, next_layout.dst, next_extent, viewport_extent,
+                              state.location.y_offset - current_extent, horizontal_flow, positive_flow)) {
       SDL_RenderCopy(renderer, next_source.texture, &next_layout.src, &next_layout.dst);
     }
     return true;

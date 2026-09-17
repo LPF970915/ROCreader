@@ -30,6 +30,7 @@ ShelfLayoutMetrics MakeShelfSceneLayoutMetrics(const LayoutMetrics &layout) {
       layout.nav_slot_w,
       layout.nav_y,
       layout.nav_pill_h,
+      layout.nav_bar_y + layout.nav_bar_h,
   };
 }
 
@@ -105,6 +106,16 @@ ShelfSceneRenderServices MakeShelfSceneRenderServices(ShelfSceneRenderServiceCal
       std::move(callbacks.remote_book_status_progress),
       std::move(callbacks.forget_texture_size),
   };
+}
+
+void ShelfScene::TickAnimations(ShelfSceneState &state, float dt, bool enabled) const {
+  state.any_grid_animating = false;
+  if (enabled) state.page_slide.Update(ShelfAnimationDelta(dt));
+  if (!enabled || (state.page_animating && !state.page_slide.IsAnimating() &&
+                   state.page_slide.Value() >= 0.999f)) {
+    state.page_animating = false;
+    state.page_slide.Snap(0.0f);
+  }
 }
 
 void ShelfScene::Draw(const ShelfSceneRenderContext &context) const {

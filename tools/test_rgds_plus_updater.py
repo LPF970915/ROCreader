@@ -1,5 +1,6 @@
 """Run in an isolated Linux container; no device or real card mounts required."""
 import os
+import configparser
 from pathlib import Path
 import shutil
 import subprocess
@@ -135,22 +136,34 @@ class UpdateInstallerTests(unittest.TestCase):
         self.assert_preserved()
 
     @unittest.skipUnless(os.environ.get("ROCREADER_TEST_DOWNLOADS"), "release package directory not provided")
-    def test_actual_ver264_package(self):
-        source = next(Path(os.environ["ROCREADER_TEST_DOWNLOADS"]).glob("*ver2.64 for RGDS plus.zip"))
+    def test_actual_release_package(self):
+        version = os.environ.get("ROCREADER_TEST_VERSION", "ver2.64")
+        source = next(Path(os.environ["ROCREADER_TEST_DOWNLOADS"]).glob(f"*{version} for RGDS plus.zip"))
         package = self.downloads / source.name
         shutil.copyfile(source, package)
         (self.app / "version.txt").write_text("ver2.03\n")
         (self.downloads / "ROCreader_update_pending.txt").write_text(
-            f"filename={package.name}\nversion=ver2.64\n"
+            f"filename={package.name}\nversion={version}\n"
         )
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual((self.app / "version.txt").read_text(), "ver2.64\n")
+        self.assertEqual((self.app / "version.txt").read_text(), version + "\n")
         with zipfile.ZipFile(source) as archive:
             self.assertEqual(
                 (self.app / "rocreader_sdl").read_bytes(),
                 archive.read("Roms/APPS/ROCreader_RGDSPlus/rocreader_sdl"),
             )
+            if tuple(map(int, version.removeprefix("ver").split("."))) >= (2, 68):
+                defaults = archive.read("Roms/APPS/ROCreader_RGDSPlus/native_config.ini")
+                self.assertNotIn(b"\r", defaults)
+                config = configparser.ConfigParser()
+                config.read_string("[defaults]\n" + defaults.decode("utf-8"))
+                self.assertEqual(config["defaults"]["animations"], "1")
+                self.assertEqual(config["defaults"]["lid_close_screen_off"], "1")
+                self.assertEqual(
+                    defaults,
+                    (SOURCE.parent / "native_config.release.ini").read_bytes().replace(b"\r\n", b"\n"),
+                )
         self.assertEqual(self.launcher.read_bytes(), SOURCE.read_bytes().replace(b"\r\n", b"\n"))
         self.assertEqual((self.root / "Imgs/ROCreader_RGDSPlus.png").read_bytes(), LOGO.read_bytes())
         self.assert_preserved()

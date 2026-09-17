@@ -128,7 +128,7 @@ constexpr float kCardScaleLinearSpeedW = 140.0f; // px/s for width scale transit
 constexpr float kCardScaleLinearSpeedH = 210.0f; // px/s for height scale transition
 constexpr float kCardScaleTailRatio = 0.52f;     // last 52% enters slow tail
 constexpr float kCardScaleTailMinMul = 0.10f;    // tail minimum speed multiplier
-constexpr float kPageSlideDurationSec = 0.52f;
+constexpr float kPageSlideDurationSec = 0.18f;  // Match ROCgalgame's shelf easing duration.
 constexpr int kReaderTapStepPx = 56;
 constexpr float kSettingsToggleGuardSec = 0.16f;
 constexpr float kMenuToggleDebounceSec = 0.12f;
@@ -2765,18 +2765,10 @@ int RunApp(int argc, char **argv) {
       }
     }
 
-    shelf_state.any_grid_animating = false;
+    shelf_scene.TickAnimations(shelf_state, dt, animate_enabled);
     if (animate_enabled) {
       app_shell.TickSceneFlash(dt, true);
-      shelf_state.page_slide.Update(dt);
-      if (shelf_state.page_animating && !shelf_state.page_slide.IsAnimating() &&
-          shelf_state.page_slide.Value() >= 0.999f) {
-        shelf_state.page_animating = false;
-        shelf_state.page_slide.Snap(0.0f);
-      }
     } else {
-      shelf_state.page_animating = false;
-      shelf_state.page_slide.Snap(0.0f);
       app_shell.TickSceneFlash(dt, false);
       if (!is_rgds_runtime && state != AppScene::Settings) menu_scene.SnapClosed(menu_state);
     }

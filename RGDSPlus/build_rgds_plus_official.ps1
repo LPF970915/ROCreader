@@ -101,6 +101,9 @@ cp /work/RGDSPlus/Imgs/ROCreader_RGDSPlus.png /work/RGDSPlus/dist_official/Roms/
 cp -a /work/RGDSPlus/dist_official/base/APPS/ROCreader /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus
 cp /work/RGDSPlus/rgds_plus_official_launcher.sh /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus.sh
 cp /work/RGDSPlus/rgds_plus_power_control.sh /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus/rgds_power_control.sh
+# Release defaults must not inherit a developer's current runtime settings.
+cp /work/RGDSPlus/native_config.release.ini /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus/native_config.ini
+sed -i 's/\r$//' /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus/native_config.ini
 rm -rf /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus/URL
 find /work/RGDSPlus/dist_official/Roms/APPS -type f -name '*.sh' -exec sed -i 's/\r$//' {} +
 chmod +x /work/RGDSPlus/dist_official/Roms/APPS/ROCreader_RGDSPlus.sh
